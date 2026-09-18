@@ -1,0 +1,244 @@
+// zen-direct: FreeTier 直连网关 v1。
+// 配方（实测）: stream:true + tools 含 opencode 57 桩名 + 官方 UA + 合法 ses/req
+// 即可 200，无需 opencode 子进程。harness 原生 tool loop 直通。
+package main
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"time"
+)
+
+const zenUA = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
+const mintChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+const mintHex = "0123456789abcdef"
+
+var (
+	mintMu      sync.Mutex
+	mintLastTs  int64
+	mintCounter int64
+)
+
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// mintIDAt 按 opencode identifier.ts 算法签发 prefix_ 开头 26 位 ID。
+func mintIDAt(prefix string, tsMs int64) string {
+	mintMu.Lock()
+	if tsMs != mintLastTs {
+		mintLastTs = tsMs
+		mintCounter = 0
+	}
+	mintCounter++
+	ctr := mintCounter
+	mintMu.Unlock()
+
+	current := uint64(tsMs)*0x1000 + uint64(ctr)
+	var sb [30]byte
+	copy(sb[:len(prefix)], prefix)
+	sb[len(prefix)] = '_'
+	for i := 0; i < 6; i++ {
+		b := byte((current >> uint(40-8*i)) & 0xff)
+		sb[len(prefix)+1+2*i] = mintHex[b>>4]
+		sb[len(prefix)+1+2*i+1] = mintHex[b&0x0f]
+	}
+	var rb [14]byte
+	if _, err := rand.Read(rb[:]); err != nil {
+		n := uint64(time.Now().UnixNano())
+		for i := range rb {
+			rb[i] = byte((n >> uint(8*(i%8))) & 0xff)
+		}
+	}
+	for i, b := range rb {
+		sb[len(prefix)+13+i] = mintChars[int(b)%62]
+	}
+	return string(sb[:])
+}
+
+func mintID(prefix string) string { return mintIDAt(prefix, time.Now().UnixMilli()) }
+
+func randHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return hex.EncodeToString([]byte(time.Now().String()))[:2*n]
+	}
+	return hex.EncodeToString(b)
+}
+
+func setDefault(h http.Header, k, v string) {
+	if h.Get(k) == "" {
+		h.Set(k, v)
+	}
+}
+
+// setZenHeaders 上游匿名鉴权头 + 官方 UA + 合法会话。
+func setZenHeaders(h http.Header, apiKey, project string) {
+	h.Del("Authorization")
+	h.Del("X-Api-Key")
+	h.Set("Authorization", "Bearer "+apiKey)
+	h.Set("User-Agent", zenUA)
+	setDefault(h, "X-Opencode-Client", "opencode")
+	setDefault(h, "X-Opencode-Session", mintID("ses"))
+	setDefault(h, "X-Opencode-Request", mintID("msg"))
+	setDefault(h, "X-Opencode-Project", project)
+}
+
+func writeErr(w http.ResponseWriter, code int, typ, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{"message": msg, "type": typ, "code": code},
+	})
+}
+
+var upstream *url.URL
+var apiKey, project string
+
+var httpClient = &http.Client{
+	Timeout: 0,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		ResponseHeaderTimeout: 60 * time.Second,
+	},
+}
+
+func forwardModels(w http.ResponseWriter, req *http.Request) {
+	u := *upstream
+	u.Path = singleJoin(upstream.Path, "/models")
+	fwd, _ := http.NewRequestWithContext(req.Context(), "GET", u.String(), nil)
+	setZenHeaders(fwd.Header, apiKey, project)
+	resp, err := httpClient.Do(fwd)
+	if err != nil {
+		writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, io.LimitReader(resp.Body, 4<<20))
+}
+
+func singleJoin(base, p string) string {
+	return strings.TrimSuffix(base, "/") + "/" + strings.TrimPrefix(p, "/")
+}
+
+// normalizeModel 去 provider 前缀：harness 发 provider/model-id（如 test/...），
+// 上游只认裸 model id（实测带前缀 401 Model is not supported）。
+func normalizeModel(in map[string]any) {
+	m, _ := in["model"].(string)
+	if i := strings.Index(m, "/"); i >= 0 {
+		in["model"] = m[i+1:]
+	}
+}
+
+// forwardResponses 直连转发：注桩后发上游。stream 原样 pipe；
+// 非流解码透传（注：zen 非流大概率 403，调用方应走 stream 或 shim 兜底）。
+func forwardResponses(w http.ResponseWriter, req *http.Request) {
+	reqID := "resp_dir_" + randHex(6)
+	raw, err := io.ReadAll(io.LimitReader(req.Body, 32<<20))
+	if err != nil {
+		writeErr(w, 400, "invalid_request_error", "read body: "+err.Error())
+		return
+	}
+	var in map[string]any
+	if err := json.Unmarshal(raw, &in); err != nil {
+		writeErr(w, 400, "invalid_request_error", "invalid json: "+err.Error())
+		return
+	}
+	stream, _ := in["stream"].(bool)
+	mergeStubTools(in)
+	normalizeModel(in)
+	upBody, _ := json.Marshal(in)
+
+	u := *upstream
+	u.Path = singleJoin(upstream.Path, "/responses")
+	fwd, _ := http.NewRequestWithContext(req.Context(), "POST", u.String(), bytes.NewReader(upBody))
+	fwd.Header.Set("Content-Type", "application/json")
+	setZenHeaders(fwd.Header, apiKey, project)
+	resp, err := httpClient.Do(fwd)
+	if err != nil {
+		writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		log.Printf("[REQ %s] upstream %d: %.300s", reqID, resp.StatusCode, string(b))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(b)
+		return
+	}
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		fl, _ := w.(http.Flusher)
+		buf := make([]byte, 32<<10)
+		for {
+			n, rerr := resp.Body.Read(buf)
+			if n > 0 {
+				if _, werr := w.Write(buf[:n]); werr != nil {
+					return
+				}
+				if fl != nil {
+					fl.Flush()
+				}
+			}
+			if rerr != nil {
+				return
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = io.Copy(w, io.LimitReader(resp.Body, 64<<20))
+}
+
+func main() {
+	var err error
+	upstream, err = url.Parse(env("OPENCODE_ZEN_BASE", "https://opencode.ai/zen/v1"))
+	if err != nil {
+		log.Fatalf("OPENCODE_ZEN_BASE 非法: %v", err)
+	}
+	apiKey = env("OPENCODE_ZEN_API_KEY", "public")
+	project = env("OPENCODE_ZEN_PROJECT", "default")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"ok","mode":"direct"}`)
+	})
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != "GET" {
+			writeErr(w, 404, "invalid_request_error", "not found")
+			return
+		}
+		forwardModels(w, req)
+	})
+	mux.HandleFunc("/v1/responses", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != "POST" {
+			writeErr(w, 404, "invalid_request_error", "not found")
+			return
+		}
+		forwardResponses(w, req)
+	})
+
+	addr := ":" + env("PORT", "8080")
+	log.Printf("zen-direct listening %s upstream %s", addr, upstream.String())
+	log.Fatal(http.ListenAndServe(addr, mux))
+}
