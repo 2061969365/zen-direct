@@ -137,4 +137,3 @@ func lookupFormat(model string) (Format, bool) {
 
 // 表格行解析与官网刷新在 zen-direct 不移植：启动零外联，只用内置快照。
 // 如需增补模型，直接改 seedBuiltinTable。
-

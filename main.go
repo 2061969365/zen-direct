@@ -150,9 +150,36 @@ func normalizeModel(in map[string]any) {
 	}
 }
 
-// forwardResponses 直连转发：注桩后发上游。stream 原样 pipe；
-// 非流解码透传（注：zen 非流大概率 403，调用方应走 stream 或 shim 兜底）。
-func forwardResponses(w http.ResponseWriter, req *http.Request) {
+func isOfficialUA(ua string) bool { return strings.HasPrefix(ua, "opencode/") }
+
+// fpForEntry 下游会话键：X-Session-Id 头优先；无头按入口格式取首文本+instructions/system。
+func fpForEntry(entry Format, h http.Header, in map[string]any) string {
+	if sid := strings.TrimSpace(h.Get("X-Session-Id")); sid != "" {
+		return fpKey(sid, "", "")
+	}
+	if sid := strings.TrimSpace(h.Get("x-session-affinity")); sid != "" {
+		return fpKey(sid, "", "")
+	}
+	ins, _ := in["instructions"].(string)
+	sys, _ := in["system"].(string)
+	first := ""
+	items, _ := in["input"].([]any)
+	msgs, _ := in["messages"].([]any)
+	if entry == FmtChat && len(msgs) > 0 {
+		if m, ok := msgs[0].(map[string]any); ok {
+			first = textOfContent(m["content"])
+		}
+	} else if len(items) > 0 {
+		if m, ok := items[0].(map[string]any); ok {
+			first = textOfContent(m["content"])
+		}
+	}
+	return fpKey("", first, ins+sys)
+}
+
+// forwardResponses 通用入口：entry 格式由 path 定，上游格式由模型表定。
+// responses 直连注桩；chat 双向转换；messages 直接 400（未探明，不裸奔）。
+func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	reqID := "resp_dir_" + randHex(6)
 	raw, err := io.ReadAll(io.LimitReader(req.Body, 32<<20))
 	if err != nil {
@@ -164,20 +191,83 @@ func forwardResponses(w http.ResponseWriter, req *http.Request) {
 		writeErr(w, 400, "invalid_request_error", "invalid json: "+err.Error())
 		return
 	}
-	stream, _ := in["stream"].(bool)
-	mergeStubTools(in)
+	if entry == FmtMessages {
+		writeErr(w, 400, "invalid_request_error", "messages entry not supported, use chat or responses")
+		return
+	}
 	normalizeModel(in)
-	upBody, _ := json.Marshal(in)
+	model, _ := in["model"].(string)
+	target, ok := lookupFormat(model)
+	if !ok {
+		target = FmtResponses // 未知模型默认 responses 透传（现行行为）
+	}
+	if target == FmtGemini || target == FmtMessages {
+		writeErr(w, 400, "invalid_request_error", "model requires unsupported upstream format: "+string(target))
+		return
+	}
+	stream, _ := in["stream"].(bool)
 
-	u := *upstream
-	u.Path = singleJoin(upstream.Path, "/responses")
-	fwd, _ := http.NewRequestWithContext(req.Context(), "POST", u.String(), bytes.NewReader(upBody))
-	fwd.Header.Set("Content-Type", "application/json")
-	setZenHeaders(fwd.Header, apiKey, project)
-	resp, err := httpClient.Do(fwd)
+	// 会话池：官方 UA 且自带真 session 不动；其余配池稳定 session。
+	// （opencode 自带 x-session-id 真会话，透传即同一 caller；harness 无头，配池。）
+	official := isOfficialUA(req.Header.Get("User-Agent")) && req.Header.Get("X-Opencode-Session") != ""
+	var fp, poolSes string
+	var isNewFP bool
+	if !official {
+		fp = fpForEntry(entry, req.Header, in)
+		poolSes, isNewFP = poolBorrowEx(fp)
+		// C 案兜底：首见 fp 的外来 blob 必为别处签发，剥 blob 留文本。
+		if entry == FmtResponses {
+			stripForeignBlobs(in, isNewFP)
+		}
+	}
+
+	// 入口 -> 上游转换。
+	upReq := in
+	if entry == FmtChat && target == FmtResponses {
+		upReq = chatToResponsesReq(in)
+	} else if entry == FmtResponses && target == FmtChat {
+		upReq = responsesToChatReq(in)
+	}
+	// 注桩（分上游格式）。
+	if target == FmtResponses {
+		mergeStubTools(upReq)
+	} else {
+		mergeChatStubTools(upReq)
+	}
+	upBody, _ := json.Marshal(upReq)
+
+	doUpstream := func(ses string) (*http.Response, error) {
+		u := *upstream
+		u.Path = singleJoin(upstream.Path, target.upstreamPath())
+		fwd, _ := http.NewRequestWithContext(req.Context(), "POST", u.String(), bytes.NewReader(upBody))
+		fwd.Header.Set("Content-Type", "application/json")
+		setZenHeaders(fwd.Header, apiKey, project)
+		if ses != "" {
+			fwd.Header.Set("X-Opencode-Session", ses)
+		}
+		return httpClient.Do(fwd)
+	}
+
+	upSes := ""
+	if !official {
+		upSes = poolSes
+	}
+	resp, err := doUpstream(upSes)
 	if err != nil {
 		writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
 		return
+	}
+	// 池 session 401/403：驱逐并同请求重试一次（新签 session，body 不变）。
+	if (resp.StatusCode == 401 || resp.StatusCode == 403) && fp != "" {
+		resp.Body.Close()
+		log.Printf("[REQ %s] pooled session expired, evict and retry once", reqID)
+		poolEvict(fp)
+		poolSes, _ = poolBorrowEx(fp)
+		resp, err = doUpstream(poolSes)
+		if err != nil {
+			writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
+			return
+		}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
@@ -189,55 +279,84 @@ func forwardResponses(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if stream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		fl, _ := w.(http.Flusher)
-		// 上游有时以 ping 帧收尾、不发 [DONE]（但给了 completed）。
-		// 有终态无 DONE 时由网关补一个，SSE 客户端才能干净结束；
-		// 无终态（半截流）绝不补，沿用“不断言完成”语义。
-		var tail []byte
-		sawTerminal, sawDone := false, false
-		note := func(p []byte) {
-			tail = append(tail, p...)
-			if len(tail) > 256 {
-				tail = tail[len(tail)-256:]
-			}
-			s := string(tail)
-			if strings.Contains(s, "response.completed") ||
-				strings.Contains(s, "response.incomplete") ||
-				strings.Contains(s, "response.failed") {
-				sawTerminal = true
-			}
-			if strings.Contains(s, "[DONE]") {
-				sawDone = true
-			}
+		// 同格式 responses 直传；跨格式走转换（DONE 语义由各转换函数保证）。
+		if entry == FmtResponses && target == FmtResponses {
+			pipeSSE(w, resp.Body)
+			return
 		}
-		buf := make([]byte, 32<<10)
-		for {
-			n, rerr := resp.Body.Read(buf)
-			if n > 0 {
-				note(buf[:n])
-				if _, werr := w.Write(buf[:n]); werr != nil {
-					return
-				}
-				if fl != nil {
-					fl.Flush()
-				}
-			}
-			if rerr != nil {
-				break
-			}
+		if entry == FmtChat && target == FmtResponses {
+			streamResponsesToChat(w, resp.Body, model)
+			return
 		}
-		if sawTerminal && !sawDone {
-			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		if entry == FmtResponses && target == FmtChat {
+			streamChatToResponses(w, resp.Body, model)
+			return
+		}
+		pipeSSE(w, resp.Body)
+		return
+	}
+	var upResp map[string]any
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&upResp); err != nil {
+		writeErr(w, 502, "upstream_error", "decode upstream response: "+err.Error())
+		return
+	}
+	out := upResp
+	if entry == FmtChat && target == FmtResponses {
+		out = responsesToChatResp(upResp, model)
+	} else if entry == FmtResponses && target == FmtChat {
+		out = chatToResponsesResp(upResp, model)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// pipeSSE 同格式流原样透传（DONE 补齐语义保留）。
+func pipeSSE(w http.ResponseWriter, r io.Reader) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	fl, _ := w.(http.Flusher)
+	// 上游有时以 ping 帧收尾、不发 [DONE]（但给了 completed）。
+	// 有终态无 DONE 时由网关补一个，SSE 客户端才能干净结束；
+	// 无终态（半截流）绝不补，沿用“不断言完成”语义。
+	var tail []byte
+	sawTerminal, sawDone := false, false
+	note := func(p []byte) {
+		tail = append(tail, p...)
+		if len(tail) > 256 {
+			tail = tail[len(tail)-256:]
+		}
+		s := string(tail)
+		if strings.Contains(s, "response.completed") ||
+			strings.Contains(s, "response.incomplete") ||
+			strings.Contains(s, "response.failed") {
+			sawTerminal = true
+		}
+		if strings.Contains(s, "[DONE]") {
+			sawDone = true
+		}
+	}
+	buf := make([]byte, 32<<10)
+	for {
+		n, rerr := r.Read(buf)
+		if n > 0 {
+			note(buf[:n])
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
 			if fl != nil {
 				fl.Flush()
 			}
 		}
-		return
+		if rerr != nil {
+			break
+		}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = io.Copy(w, io.LimitReader(resp.Body, 64<<20))
+	if sawTerminal && !sawDone {
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+	}
 }
 
 func main() {
@@ -248,6 +367,8 @@ func main() {
 	}
 	apiKey = env("OPENCODE_ZEN_API_KEY", "public")
 	project = env("OPENCODE_ZEN_PROJECT", "default")
+	seedBuiltinTable()
+	poolLoad()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
@@ -261,13 +382,18 @@ func main() {
 		}
 		forwardModels(w, req)
 	})
-	mux.HandleFunc("/v1/responses", func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != "POST" {
-			writeErr(w, 404, "invalid_request_error", "not found")
-			return
+	post := func(entry Format) func(http.ResponseWriter, *http.Request) {
+		return func(w http.ResponseWriter, req *http.Request) {
+			if req.Method != "POST" {
+				writeErr(w, 404, "invalid_request_error", "not found")
+				return
+			}
+			forwardResponses(w, req, entry)
 		}
-		forwardResponses(w, req)
-	})
+	}
+	mux.HandleFunc("/v1/responses", post(FmtResponses))
+	mux.HandleFunc("/v1/chat/completions", post(FmtChat))
+	mux.HandleFunc("/v1/messages", post(FmtMessages))
 
 	addr := ":" + env("PORT", "8080")
 	log.Printf("zen-direct listening %s upstream %s", addr, upstream.String())
