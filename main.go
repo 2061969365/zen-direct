@@ -189,10 +189,31 @@ func forwardResponses(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		fl, _ := w.(http.Flusher)
+		// 上游有时以 ping 帧收尾、不发 [DONE]（但给了 completed）。
+		// 有终态无 DONE 时由网关补一个，SSE 客户端才能干净结束；
+		// 无终态（半截流）绝不补，沿用“不断言完成”语义。
+		var tail []byte
+		sawTerminal, sawDone := false, false
+		note := func(p []byte) {
+			tail = append(tail, p...)
+			if len(tail) > 256 {
+				tail = tail[len(tail)-256:]
+			}
+			s := string(tail)
+			if strings.Contains(s, "response.completed") ||
+				strings.Contains(s, "response.incomplete") ||
+				strings.Contains(s, "response.failed") {
+				sawTerminal = true
+			}
+			if strings.Contains(s, "[DONE]") {
+				sawDone = true
+			}
+		}
 		buf := make([]byte, 32<<10)
 		for {
 			n, rerr := resp.Body.Read(buf)
 			if n > 0 {
+				note(buf[:n])
 				if _, werr := w.Write(buf[:n]); werr != nil {
 					return
 				}
@@ -201,9 +222,16 @@ func forwardResponses(w http.ResponseWriter, req *http.Request) {
 				}
 			}
 			if rerr != nil {
-				return
+				break
 			}
 		}
+		if sawTerminal && !sawDone {
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = io.Copy(w, io.LimitReader(resp.Body, 64<<20))
