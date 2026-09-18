@@ -71,6 +71,9 @@ func mintIDAt(prefix string, tsMs int64) string {
 
 func mintID(prefix string) string { return mintIDAt(prefix, time.Now().UnixMilli()) }
 
+// newID envelop ID（移植老仓，供转换函数用）。
+func newID(prefix string) string { return prefix + randHex(12) }
+
 func randHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
