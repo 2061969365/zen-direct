@@ -83,8 +83,14 @@ func poolLookup(fp string) string {
 
 // poolBorrow 查池；失配则 mint 新签并入库返回。
 func poolBorrow(fp string) string {
+	ses, _ := poolBorrowEx(fp)
+	return ses
+}
+
+// poolBorrowEx 同 poolBorrow，多返回 isNew（首见=true，给剥 blob 用）。
+func poolBorrowEx(fp string) (string, bool) {
 	if s := poolLookup(fp); s != "" {
-		return s
+		return s, false
 	}
 	ses := mintID("ses")
 	poolMu.Lock()
@@ -102,7 +108,7 @@ func poolBorrow(fp string) string {
 	poolDirty = true
 	poolMu.Unlock()
 	poolSaveAsync()
-	return ses
+	return ses, true
 }
 
 // poolEvict 驱逐映射（上游 401/403 死 session 后调用）。
