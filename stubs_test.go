@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"testing"
 )
 
@@ -33,6 +34,18 @@ func TestMergeStubTools(t *testing.T) {
 			t.Fatalf("重复：%s x%d", n, c)
 		}
 	}
+	// 客户端的 bash 定义必须原样保留（不能被桩覆盖），57 名必须齐。
+	for _, raw := range items {
+		m, _ := raw.(map[string]any)
+		if m["name"] == "bash" && m["description"] != "client tool" {
+			t.Fatalf("客户端 bash 被桩覆盖：%v", m["description"])
+		}
+	}
+	for _, n := range stubToolNames {
+		if seen[n] != 1 {
+			t.Fatalf("桩名缺失或重复：%s x%d", n, seen[n])
+		}
+	}
 	// 无 tools 键时全量补桩。
 	empty := map[string]any{}
 	mergeStubTools(empty)
@@ -52,5 +65,38 @@ func TestNormalizeModel(t *testing.T) {
 	normalizeModel(bare)
 	if bare["model"] != "muse-spark-1.3-contributor-free" {
 		t.Fatalf("裸 id 不应动：%v", bare["model"])
+	}
+}
+
+func TestStubDedupOnWire(t *testing.T) {
+	withMockUpstream(t, "data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n")
+	body := `{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"tools":[{"type":"function","name":"bash","description":"client tool","parameters":{"type":"object"}},{"type":"function","name":"my_tool","description":"x","parameters":{"type":"object"}}]}`
+	code, _ := postResponses(t, "http://x", body)
+	if code != 200 {
+		t.Fatalf("mock上游应200: %d", code)
+	}
+	_, upBody, _ := getLastUp()
+	var up map[string]any
+	if err := json.Unmarshal([]byte(upBody), &up); err != nil {
+		t.Fatalf("上游体应为合法JSON: %v", err)
+	}
+	tools, _ := up["tools"].([]any)
+	seen := map[string]int{}
+	desc := map[string]string{}
+	for _, raw := range tools {
+		m, _ := raw.(map[string]any)
+		n, _ := m["name"].(string)
+		seen[n]++
+		if d, ok := m["description"].(string); ok {
+			desc[n] = d
+		}
+	}
+	for _, n := range stubToolNames {
+		if seen[n] != 1 {
+			t.Fatalf("线名缺失或重复：%s x%d（共%d个tools）", n, seen[n], len(tools))
+		}
+	}
+	if seen["my_tool"] != 1 || desc["bash"] != "client tool" {
+		t.Fatalf("客户端工具未原样上游：bash=%q my_tool=%d", desc["bash"], seen["my_tool"])
 	}
 }
