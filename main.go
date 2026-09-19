@@ -140,6 +140,8 @@ var httpClient = &http.Client{
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   20,
 		ResponseHeaderTimeout: 60 * time.Second,
+		// 透明 gzip 无上限解压=压缩炸弹敞口；SSE/JSON 体小，关了只多一点带宽。
+		DisableCompression: true,
 		// 代理/VPN 常静默掐空闲 keep-alive（对端 RST/半开），池里陈连接复用即
 		// unexpected EOF。用比缺省更短的空闲上限，宁可多建连，不复用僵尸连接。
 		IdleConnTimeout: 60 * time.Second,
@@ -373,7 +375,14 @@ func logForensics(reqID string, entry Format, model, fp string, in map[string]an
 // responses 直连注桩；chat 双向转换；messages 直接 400（未探明，不裸奔）。
 func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	reqID := "resp_dir_" + randHex(6)
+	// 熔断开直接 fast-fail：不占槽、不打上游（风暴时减负）。
+	if !cbAllow() {
+		log.Printf("[REQ %s] circuit open, fast-fail 502", reqID)
+		writeErr(w, 502, "circuit_open", "upstream circuit open, retry later")
+		return
+	}
 	// 并发门在读体之前：排队请求不抱 32MB（先读后抢=内存放大器）。
+	waitStart := time.Now()
 	select {
 	case fwdSem <- struct{}{}:
 		defer func() { <-fwdSem }()
@@ -381,6 +390,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		writeErr(w, 499, "client_closed", "client closed while queued")
 		return
 	}
+	waitMs := time.Since(waitStart).Milliseconds()
 	raw, err := io.ReadAll(io.LimitReader(req.Body, int64(maxReqBody)+1))
 	if err != nil {
 		writeErr(w, 400, "invalid_request_error", "read body: "+err.Error())
@@ -446,8 +456,25 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		return b
 	}
 	upBody := buildBody()
-	log.Printf("[REQ %s] in=%s model=%s target=%s stream=%v official=%v fp=%s ses=%s new=%v upBytes=%d",
-		reqID, entry, model, target, stream, official, shortStr(fp, 16), shortStr(poolSes, 20), isNewFP, len(upBody))
+	// 失败轮不进池：本轮新建的 session 若首战即败（传输错/非 2xx），
+	// 直接驱逐，免死 session 占池坑；命中轮（老 lineage）绝不驱逐。
+	// 半截流（terminal=false）不驱逐：首轮已有响应输出，lineage 有效，
+	// 驱逐反丢 lineage；残留毒串由既有 400 自愈机制兜底。
+	// 401/403 与 caller-mismatch 分支已做 poolRotate，不在此列。
+	evictIfNewFP := func() {
+		if usePool && isNewFP {
+			poolEvict(fp)
+		}
+	}
+	log.Printf("[REQ %s] in=%s model=%s target=%s stream=%v official=%v fp=%s ses=%s new=%v upBytes=%d waitMs=%d",
+		reqID, entry, model, target, stream, official, shortStr(fp, 16), shortStr(poolSes, 20), isNewFP, len(upBody), waitMs)
+		if len(upBody) > 1<<20 {
+			var nItems int
+			if arr, ok := in["input"].([]any); ok {
+				nItems = len(arr)
+			}
+			log.Printf("[REQ %s] WARN huge upstream body bytes=%d nItems=%d", reqID, len(upBody), nItems)
+		}
 	if debugOn() {
 		ids := collectReasoningIDs(in)
 		log.Printf("[REQ %s] debug reasoningIDs=%v", reqID, ids)
@@ -486,6 +513,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		resp, err = doUpstream(upSes, upBody)
 	}
 	if err != nil {
+		evictIfNewFP()
 		writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
 		return
 	}
@@ -535,6 +563,8 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	ir := newIdleTimeoutBody(resp.Body, streamIdle)
 	defer ir.Close()
 	if resp.StatusCode != 200 {
+		cbRecord(resp.StatusCode) // 只计 5xx；4xx（门禁/毒串）是请求问题，不熔断。
+		evictIfNewFP()
 		b, _ := io.ReadAll(io.LimitReader(ir, 256<<10))
 		log.Printf("[REQ %s] upstream %d: %.300s", reqID, resp.StatusCode, string(b))
 		if ct := resp.Header.Get("Content-Type"); ct != "" {
@@ -546,6 +576,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		_, _ = w.Write(b)
 		return
 	}
+	cbRecord(200) // 上游受理（流式以响应头 200 为准，中途截断不影响受理计数）。
 	if stream {
 		// 同格式 responses 直传；跨格式走转换（DONE 语义由各转换函数保证）。
 		if entry == FmtResponses && target == FmtResponses {
@@ -568,6 +599,13 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		writeErr(w, 502, "upstream_error", "decode upstream response: "+err.Error())
 		return
 	}
+	// 非流 completed 同样回显 tools：harness 自带定义，删之（有 output 才认定是响应体形状）。
+	if _, hasOut := upResp["output"]; hasOut {
+		if tools, ok := upResp["tools"].([]any); ok && len(tools) > 0 {
+			delete(upResp, "tools")
+			log.Printf("[REQ %s] stripped %d echoed tools from non-stream response", reqID, len(tools))
+		}
+	}
 	out := upResp
 	if entry == FmtChat && target == FmtResponses {
 		out = responsesToChatResp(upResp, model)
@@ -584,6 +622,35 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 // 发 response.failed（code+type 双写，pi-ai 只读 code）再补 DONE——
 // 下游从“ended before terminal”UNKNOWN 变为可分类错误
 // （harness 走 TIMEOUT/TRANSPORT 重试），不再静默挂起。
+// stripCompletedToolsLine 剥 response.completed 帧里的 tools 回显数组。
+// harness 自带工具定义，回显纯冗余（实测 30KB+ 单行，巨帧正是下游 parse 炸的主因）；
+// reasoning/usage/output 原样保留。只认 data: 行 + 含 "response.completed"；
+// 解析失败一律原样（不猜不修）。
+func stripCompletedToolsLine(line []byte) []byte {
+	t := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(t, []byte("data:")) || !bytes.Contains(t, []byte(`"response.completed"`)) {
+		return line
+	}
+	payload := bytes.TrimSpace(bytes.TrimPrefix(t, []byte("data:")))
+	var m map[string]any
+	if err := json.Unmarshal(payload, &m); err != nil {
+		return line
+	}
+	resp, ok := m["response"].(map[string]any)
+	if !ok {
+		return line
+	}
+	if _, ok := resp["tools"]; !ok {
+		return line
+	}
+	delete(resp, "tools")
+	out, err := json.Marshal(m)
+	if err != nil {
+		return line
+	}
+	return append(append([]byte("data: "), out...), '\n')
+}
+
 func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string) {
 	start := time.Now()
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -631,18 +698,46 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string) {
 	}
 	buf := make([]byte, 32<<10)
 	var nBytes int64
+	// 行缓冲：只转发行（以 \n 结尾），半截永不落地。
+	// 延迟不变（逐行 flush）；探测 note() 仍喂原始字节流，overlap 语义不变。
+	var pending []byte
 	var upErr, downErr error
+	emit := func(line []byte) {
+		nBytes += int64(len(line))
+		note(line)
+		if _, werr := w.Write(line); werr != nil {
+			downErr = werr
+		} else if fl != nil {
+			fl.Flush()
+		}
+	}
 	for {
 		n, rerr := r.Read(buf)
 		if n > 0 {
-			nBytes += int64(n)
-			note(buf[:n])
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				downErr = werr
+			pending = append(pending, buf[:n]...)
+			for {
+				i := bytes.IndexByte(pending, '\n')
+				if i < 0 {
+					break
+				}
+				emit(stripCompletedToolsLine(pending[:i+1]))
+				pending = pending[i+1:]
+				if downErr != nil {
+					break
+				}
+			}
+			if downErr != nil {
 				break
 			}
-			if fl != nil {
-				fl.Flush()
+			// 错乱上游单行永不换行：8MB 兜底直发，防 pending 无界涨内存
+			// （正常 completed 单行 <1MB）。
+			if len(pending) > 8<<20 {
+				log.Printf("[REQ %s] stream huge line without newline, passthrough %d bytes", reqID, len(pending))
+				emit(pending)
+				pending = nil
+				if downErr != nil {
+					break
+				}
 			}
 		}
 		if rerr != nil {
@@ -669,6 +764,11 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string) {
 		return
 	}
 	if !sawTerminal {
+		// 半截尾部吞掉不转发（下游严格 parse 见半截 data: 必炸）；
+		// 发 failed+DONE 走可重试终态，本轮内容由重试无损拿回。
+		if len(pending) > 0 {
+			log.Printf("[REQ %s] stream swallowed partial line bytes=%d", reqID, len(pending))
+		}
 		msg, code := "upstream stream ended without terminal event", "upstream_truncated"
 		if timedOut {
 			msg, code = "upstream idle timeout", "upstream_timeout"
