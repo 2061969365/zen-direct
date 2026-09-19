@@ -1,3 +1,6 @@
 *.exe
 *~
 zen-direct
+zen-direct-linux-amd64
+zen-direct-windows-amd64.exe
+zen-direct-shadow.exe

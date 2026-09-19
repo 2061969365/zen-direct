@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -233,7 +235,108 @@ func TestDoneQuotedMarkers(t *testing.T) {
 	}
 }
 
-// 上游错误：状态码直透 + Content-Type 透传。
+// caller-mismatch 自愈：池命中+毒历史 -> 首轮 400 -> 轮换+剥离重发 -> 客户端 200。
+func TestCallerMismatchSelfHeal(t *testing.T) {
+	resetPoolForTest()
+	var mu sync.Mutex
+	var bodies, sessions []string
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		b, _ := io.ReadAll(req.Body)
+		calls.Add(1)
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		sessions = append(sessions, req.Header.Get("X-Opencode-Session"))
+		mu.Unlock()
+		// 行为仿真上游：见毒 blob 即 caller-mismatch 400，否则 200。
+		if strings.Contains(string(b), "POISONBLOB") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"reasoning encrypted_content was not issued to this caller"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"r1","status":"completed","output":[]}`))
+	}))
+	defer srv.Close()
+	old := upstream
+	upstream = mustParseURL(t, srv.URL)
+	defer func() { upstream = old }()
+
+	ask := `{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":"same first"}]}`
+	if code, _ := postResponses(t, "http://x", ask); code != 200 {
+		t.Fatalf("首轮干净请求应 200，得 %d", code)
+	}
+	// 同 fp（同首条）+ 毒 reasoning：池命中不剥离，首轮上游 400，自愈后 200。
+	poison := `{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":"same first"},{"type":"reasoning","id":"rs_p","encrypted_content":"POISONBLOB","summary":[]}]}`
+	code, body := postResponses(t, "http://x", poison)
+	if code != 200 {
+		t.Fatalf("自愈后客户端应 200，得 %d body=%.200s", code, body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 3 {
+		t.Fatalf("应 3 次上游调用（干净+毒+自愈），得 %d", len(bodies))
+	}
+	if !strings.Contains(bodies[1], "POISONBLOB") {
+		t.Fatal("首轮毒串应原样上游（池命中不剥）")
+	}
+	if strings.Contains(bodies[2], "POISONBLOB") {
+		t.Fatalf("自愈重发应已剥毒：%.300s", bodies[2])
+	}
+	if sessions[1] == sessions[2] {
+		t.Fatal("自愈应轮换 session")
+	}
+}
+
+// 非 caller-mismatch 的 400 不触发自愈，原样透传。
+func TestNonMismatch400Passthru(t *testing.T) {
+	resetPoolForTest()
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"plain bad request"}}`))
+	}))
+	defer srv.Close()
+	old := upstream
+	upstream = mustParseURL(t, srv.URL)
+	defer func() { upstream = old }()
+	code, body := postResponses(t, "http://x", `{"model":"m","input":"hi"}`)
+	if code != 400 || !strings.Contains(body, "plain bad request") {
+		t.Fatalf("应原样透传 400，得 %d %.200s", code, body)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("非 mismatch 不得重试，得 %d 次调用", calls.Load())
+	}
+}
+
+// strip 内嵌形态：message.content[] 里的 reasoning 同规则剥离。
+func TestStripNestedContent(t *testing.T) {
+	in := map[string]any{"input": []any{
+		map[string]any{"type": "message", "role": "assistant", "content": []any{
+			map[string]any{"type": "text", "text": "hi"},
+			map[string]any{"type": "reasoning", "id": "rs_n", "encrypted_content": "b",
+				"summary": []any{map[string]any{"type": "summary_text", "text": "t"}}},
+			map[string]any{"type": "reasoning", "id": "rs_p", "encrypted_content": "b"},
+		}},
+	}}
+	stripForeignBlobs(in, true)
+	items, _ := in["input"].([]any)
+	content, _ := items[0].(map[string]any)["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("内嵌应剩 text+去绑定 reasoning，得 %d", len(content))
+	}
+	rs, _ := content[1].(map[string]any)
+	if _, ok := rs["encrypted_content"]; ok {
+		t.Fatal("内嵌 blob 应剥掉")
+	}
+	if _, ok := rs["id"]; ok {
+		t.Fatal("内嵌外来 id 应剥掉")
+	}
+}
+
 func TestUpstreamErrorPassthrough(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
