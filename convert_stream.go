@@ -124,6 +124,13 @@ func (b *idleTimeoutBody) Close() error {
 	return rc.Close()
 }
 
+// wasTimeout 上游是否因包体空闲超时被掐断（供 pipeSSE 定 failed 文案）。
+func (b *idleTimeoutBody) wasTimeout() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.timedOut
+}
+
 func (s *sseSink) emit(v any) {
 	b, err := json.Marshal(v)
 	if err != nil {

@@ -100,12 +100,15 @@ func TestStreamKeepsSingleDone(t *testing.T) {
 	}
 }
 
-// 半截流无终态：绝不补 DONE。
+// 半截流无终态：发 response.failed（可分类）再补 DONE，不静默断流。
 func TestStreamTruncatedNoDone(t *testing.T) {
 	withMockUpstream(t, "data: {\"type\":\"response.output_text.delta\"}\n\n")
 	_, body := postResponses(t, "http://x", `{"model":"m","stream":true,"input":"hi"}`)
-	if strings.Contains(body, "[DONE]") {
-		t.Fatalf("半截流不应补 DONE：%q", body)
+	if !strings.Contains(body, "response.failed") {
+		t.Fatalf("半截流应发 failed：%q", body)
+	}
+	if !strings.Contains(body, "[DONE]") {
+		t.Fatalf("failed 后应补 DONE：%q", body)
 	}
 }
 

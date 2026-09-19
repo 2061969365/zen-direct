@@ -2,6 +2,7 @@ package main
 
 // v0.2.1 硬化单测：P0 并发门/413/隔离/直通/桩禁调，P1 模型归一/轮换/落盘/DONE，P2 透传。
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -207,29 +208,41 @@ func TestIdleTimeoutFires(t *testing.T) {
 	}
 }
 
-// DONE：正文裸词不误判；真 JSON 终态 / event: 行终态补 DONE。
+// DONE：正文裸词不误判终态帧；真 JSON 终态 / event: 行终态补 DONE；
+// 无终态即结束（上游半截/stall）发 response.failed（code+type）再补 DONE，
+// 下游从“ended before terminal”UNKNOWN 变为可分类错误。
 func TestDoneQuotedMarkers(t *testing.T) {
-	// 正文含裸词 response.completed（前后无引号）但无终态帧：不补。
+	// 正文含裸词 response.completed（前后无引号）但无终态帧：发 failed + DONE，不静默。
 	rec := httptest.NewRecorder()
-	pipeSSE(rec, strings.NewReader("data: {\"text\":\"see response.completed docs\"}\n\n"))
-	if strings.Contains(rec.Body.String(), "[DONE]") {
-		t.Fatalf("裸词不得误判终态：%q", rec.Body.String())
+	pipeSSE(rec, strings.NewReader("data: {\"text\":\"see response.completed docs\"}\n\n"), "req_t1", "m")
+	body := rec.Body.String()
+	if !strings.Contains(body, "response.failed") {
+		t.Fatalf("无终态应发 failed：%q", body)
 	}
-	// 真 JSON 终态补 DONE。
+	if !strings.Contains(body, "[DONE]") {
+		t.Fatalf("failed 后应补 DONE：%q", body)
+	}
+	if !strings.Contains(body, `"code":"upstream_truncated"`) {
+		t.Fatalf("failed 应带 code（pi-ai 只读 code）：%q", body)
+	}
+	// 真 JSON 终态补 DONE，且不发 failed。
 	rec2 := httptest.NewRecorder()
-	pipeSSE(rec2, strings.NewReader("data: {\"type\":\"response.completed\"}\n\n"))
+	pipeSSE(rec2, strings.NewReader("data: {\"type\":\"response.completed\"}\n\n"), "req_t2", "m")
 	if !strings.Contains(rec2.Body.String(), "[DONE]") {
 		t.Fatalf("真终态应补 DONE：%q", rec2.Body.String())
 	}
+	if strings.Contains(rec2.Body.String(), "response.failed") {
+		t.Fatalf("真终态不得发 failed：%q", rec2.Body.String())
+	}
 	// 上游主形态 event: 行终态补 DONE。
 	rec3 := httptest.NewRecorder()
-	pipeSSE(rec3, strings.NewReader("event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"))
+	pipeSSE(rec3, strings.NewReader("event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"), "req_t3", "m")
 	if !strings.Contains(rec3.Body.String(), "[DONE]") {
 		t.Fatalf("event 行终态应补 DONE：%q", rec3.Body.String())
 	}
 	// 上游自带 data: DONE（无空格形态也认）：不重复。
 	rec4 := httptest.NewRecorder()
-	pipeSSE(rec4, strings.NewReader("event: response.completed\ndata: {\"x\":1}\n\ndata:[DONE]\n\n"))
+	pipeSSE(rec4, strings.NewReader("event: response.completed\ndata: {\"x\":1}\n\ndata:[DONE]\n\n"), "req_t4", "m")
 	if strings.Count(rec4.Body.String(), "[DONE]") != 1 {
 		t.Fatalf("DONE 应恰好一个：%q", rec4.Body.String())
 	}
@@ -396,5 +409,135 @@ func TestShortStr(t *testing.T) {
 	}
 	if shortStr("abcdef", 3) != "abc" {
 		t.Fatal("long strings must truncate")
+	}
+}
+
+func TestPipeSSEFailedHasCode(t *testing.T) {
+	rec := httptest.NewRecorder()
+	pipeSSE(rec, strings.NewReader("data: {\"a\":1}\n\n"), "req_fc", "mm")
+	if !strings.Contains(rec.Body.String(), `"code":"upstream_truncated"`) {
+		t.Fatalf("failed缺code: %q", rec.Body.String())
+	}
+}
+
+func TestPipeSSEIdleTimeoutMsg(t *testing.T) {
+	pr, pw := io.Pipe()
+	ir := newIdleTimeoutBody(pr, 20*time.Millisecond)
+	defer ir.Close()
+	defer pw.Close()
+	rec := httptest.NewRecorder()
+	pipeSSE(rec, ir, "req_to", "mm")
+	if !strings.Contains(rec.Body.String(), "upstream idle timeout") {
+		t.Fatalf("stall应报timeout failed: %q", rec.Body.String())
+	}
+}
+
+func TestBadIDStripOnHit(t *testing.T) {
+	learnBadIDs([]string{"rs_poison1", "nested:rs_poison2"})
+	in := map[string]any{"input": []any{
+		map[string]any{"type": "reasoning", "id": "rs_poison1",
+			"encrypted_content": "BLOB", "summary": []any{map[string]any{"type": "summary_text", "text": "keep me"}}},
+		map[string]any{"type": "reasoning", "id": "rs_clean1", "encrypted_content": "BLOB2"},
+		map[string]any{"type": "message", "content": []any{
+			map[string]any{"type": "reasoning", "id": "rs_poison2", "encrypted_content": "BLOB3"},
+		}},
+	}}
+	if n := stripKnownBadIDs(in); n != 2 {
+		t.Fatalf("want 2 stripped, got %d", n)
+	}
+	items := in["input"].([]any)
+	m0 := items[0].(map[string]any)
+	if _, ok := m0["encrypted_content"]; ok {
+		t.Fatal("poison blob must go")
+	}
+	if _, ok := m0["id"]; ok {
+		t.Fatal("poison id must go")
+	}
+	if m0["summary"] == nil {
+		t.Fatal("summary text must stay")
+	}
+	m1 := items[1].(map[string]any)
+	if m1["id"] != "rs_clean1" || m1["encrypted_content"] != "BLOB2" {
+		t.Fatal("clean item must pass through")
+	}
+}
+
+func TestBadIDCap(t *testing.T) {
+	for i := 0; i < maxBadIDs+100; i++ {
+		learnBadIDs([]string{"rs_cap_" + string(rune(i))})
+	}
+	badMu.Lock()
+	n := len(badIDs)
+	badMu.Unlock()
+	if n > maxBadIDs {
+		t.Fatalf("cap exceeded: %d", n)
+	}
+}
+
+func TestPipeSSEFarTerminal(t *testing.T) {
+	// 终态标记距 EOF 超 4KB（completed 回显 57 桩 tools 的 8KB+ 单行）：
+	// 粘性标记不得因窗口挤出而误报 failed。
+	pad := strings.Repeat("x", 9000)
+	body := "data: {\"type\":\"response.completed\"}\n\ndata: {\"pad\":\"" + pad + "\"}\n\n"
+	rec := httptest.NewRecorder()
+	pipeSSE(rec, strings.NewReader(body), "req_far", "mm")
+	out := rec.Body.String()
+	if strings.Contains(out, "response.failed") {
+		t.Fatalf("远端标记不得误报 failed: %.200s", out)
+	}
+}
+
+func TestIsTransportRetryable(t *testing.T) {
+	for _, s := range []string{
+		`Post "https://x": unexpected EOF`,
+		`read: connection reset by peer`,
+		`write: broken pipe`,
+		`Post "https://x": EOF`,
+	} {
+		if !isTransportRetryable(errors.New(s)) {
+			t.Fatalf("should retry: %s", s)
+		}
+	}
+	for _, s := range []string{
+		`no such host`,
+		`context deadline exceeded`,
+		`proxyconnect tcp: dial tcp: connect: connection refused`,
+	} {
+		if isTransportRetryable(errors.New(s)) {
+			t.Fatalf("should NOT retry: %s", s)
+		}
+	}
+	if isTransportRetryable(nil) {
+		t.Fatal("nil must not retry")
+	}
+}
+
+func TestTransportRetryOnce(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if calls.Add(1) == 1 {
+			// 首连接直接掐：客户端拿传输层错（EOF/RST 类）。
+			hj, _ := w.(http.Hijacker)
+			conn, _, _ := hj.Hijack()
+			conn.Close()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_retry","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	old := upstream
+	upstream = u
+	defer func() { upstream = old }()
+	code, body := postResponses(t, "http://x", `{"model":"m","stream":false,"input":"hi"}`)
+	if code != 200 {
+		t.Fatalf("retry后应200: http=%d body=%.200s", code, body)
+	}
+	if !strings.Contains(body, "resp_retry") {
+		t.Fatalf("应拿到重试后的响应: %.200s", body)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("应恰好上游2次: %d", calls.Load())
 	}
 }
