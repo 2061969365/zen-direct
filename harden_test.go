@@ -2,6 +2,8 @@ package main
 
 // v0.2.1 硬化单测：P0 并发门/413/隔离/直通/桩禁调，P1 模型归一/轮换/落盘/DONE，P2 透传。
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -539,5 +541,156 @@ func TestTransportRetryOnce(t *testing.T) {
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("应恰好上游2次: %d", calls.Load())
+	}
+}
+
+func TestPipeSSESwallowsPartial(t *testing.T) {
+	rec := httptest.NewRecorder()
+	// 半截行：无换行结尾、无终态 → 下游不得见到半截 data:，只见 failed+DONE。
+	pipeSSE(rec, strings.NewReader("data: {\"type\":\"response.output_text.del"), "req_part", "m")
+	body := rec.Body.String()
+	if strings.Contains(body, "output_text.del") {
+		t.Fatalf("半截行被透传下游: %.200s", body)
+	}
+	if !strings.Contains(body, "response.failed") || !strings.Contains(body, "[DONE]") {
+		t.Fatalf("应补 failed+DONE: %.300s", body)
+	}
+}
+
+func TestStripCompletedTools(t *testing.T) {
+	tools := `{"type":"function","name":"bash","description":"internal capability marker, never call","parameters":{"type":"object"}},{"type":"function","name":"read","description":"internal capability marker, never call","parameters":{"type":"object"}}`
+	line := []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"tools\":[" + tools + "],\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"BLOB123\"}],\"usage\":{\"total_tokens\":5}}}\n")
+	out := stripCompletedToolsLine(line)
+	if bytes.Contains(out, []byte("never call")) {
+		t.Fatalf("工具回显未剥离: %.200s", out)
+	}
+	rest := bytes.TrimPrefix(out, []byte("data:"))
+	var m map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(rest), &m); err != nil {
+		t.Fatalf("剥离后不是合法JSON: %v", err)
+	}
+	resp, _ := m["response"].(map[string]any)
+	if _, ok := resp["tools"]; ok {
+		t.Fatal("response.tools 应被删除")
+	}
+	output, _ := resp["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output 应保留: %v", resp["output"])
+	}
+	// 非 completed 行必须原样。
+	plain := []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n")
+	if got := stripCompletedToolsLine(plain); !bytes.Equal(got, plain) {
+		t.Fatalf("非 completed 行被改动: %q", got)
+	}
+	// 坏 JSON 的 completed 行原样放过（不猜不修）。
+	bad := []byte("data: {\"type\":\"response.completed\",\"response\":{oops}\n")
+	if got := stripCompletedToolsLine(bad); !bytes.Equal(got, bad) {
+		t.Fatalf("坏行应原样: %q", got)
+	}
+}
+
+func TestCircuitBreaker(t *testing.T) {
+	oldT, oldW := cbThreshold, cbOpenWindow
+	cbThreshold, cbOpenWindow = 3, 50*time.Millisecond
+	defer func() { cbThreshold, cbOpenWindow = oldT, oldW; cbReset() }()
+	cbReset()
+	cbRecord(500)
+	cbRecord(502)
+	if !cbAllow() {
+		t.Fatal("2次失败不应开")
+	}
+	cbRecord(503)
+	if cbAllow() {
+		t.Fatal("3次5xx应熔断")
+	}
+	time.Sleep(60 * time.Millisecond)
+	if !cbAllow() {
+		t.Fatal("窗口过后应放一个半开探测")
+	}
+	if cbAllow() {
+		t.Fatal("探测未回就应继续拦")
+	}
+	cbRecord(500) // 探测失败：重开
+	if cbAllow() {
+		t.Fatal("探测失败应重开")
+	}
+	time.Sleep(60 * time.Millisecond)
+	if !cbAllow() {
+		t.Fatal("应再放探测")
+	}
+	cbRecord(200) // 探测成功：关闭
+	if !cbAllow() {
+		t.Fatal("成功后应关闭")
+	}
+	cbRecord(500)
+	if !cbAllow() {
+		t.Fatal("关闭后计数应清零，单次失败不应开")
+	}
+	cbRecord(400)
+	cbRecord(200)
+	if !cbAllow() {
+		t.Fatal("4xx/200 不得计数")
+	}
+}
+
+func TestFailedTurnEvictsNewSession(t *testing.T) {
+	defer cbReset()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(500)
+		_, _ = w.Write([]byte(`{"error":"boom"}`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	old := upstream
+	upstream = u
+	defer func() { upstream = old }()
+	body := `{"model":"m","stream":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
+	code, _ := postResponses(t, "http://x", body)
+	if code != 500 {
+		t.Fatalf("应透传500: %d", code)
+	}
+	var in map[string]any
+	_ = json.Unmarshal([]byte(body), &in)
+	fp, keyed := fpForEntry(FmtResponses, http.Header{}, in)
+	if !keyed {
+		t.Fatal("该输入应可定键")
+	}
+	if s := poolLookup(fp); s != "" {
+		t.Fatalf("失败轮的新 session 应被驱逐，残留 %q", s)
+	}
+	// 命中轮失败不断 lineage：预种后 500，应保留。
+	ses, isNew := poolBorrowEx(fp)
+	if !isNew {
+		t.Fatal("预种应为首见")
+	}
+	code, _ = postResponses(t, "http://x", body)
+	if code != 500 {
+		t.Fatalf("应透传500: %d", code)
+	}
+	if s := poolLookup(fp); s != ses {
+		t.Fatalf("命中轮失败应保留 lineage，池内=%q 预种=%q", s, ses)
+	}
+	poolEvict(fp)
+}
+
+func TestNonStreamStripsEchoedTools(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"r1","status":"completed","tools":[{"type":"function","name":"bash","description":"internal capability marker, never call"}],"output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}],"usage":{"total_tokens":3}}`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	old := upstream
+	upstream = u
+	defer func() { upstream = old }()
+	code, body := postResponses(t, "http://x", `{"model":"m","stream":false,"input":"hi"}`)
+	if code != 200 {
+		t.Fatalf("应200: %d body=%.200s", code, body)
+	}
+	if strings.Contains(body, "never call") {
+		t.Fatalf("非流工具回显未剥离: %.300s", body)
+	}
+	if !strings.Contains(body, "hi") {
+		t.Fatalf("正文丢失: %.300s", body)
 	}
 }
