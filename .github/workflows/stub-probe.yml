@@ -73,24 +73,22 @@ jobs:
           print("MODEL:", b.get('model'), "| STREAM:", b.get('stream'), "| STORE:", b.get('store'))
           print("REASONING:", json.dumps(b.get('reasoning')))
           EOF
-      # replay matrix against the REAL gate:
-      # R1 clean-10 bare | R2 clean-10 + prompt_cache_key/store/tool_choice/max_tokens (official extras)
+      # replay matrix round 3: bisect the 44 cad names.
+      # R3 clean10+cad[:22] | R4 clean10+cad[22:] | R5 clean10+all44
       - run: |
           python3 - <<'EOF'
           import json, secrets, urllib.request
           rec = json.load(open('recorded.json'))
           b = rec['body']
-          tools = b.get('tools')
-          names = []
-          if isinstance(tools, list):
-              for t in tools:
-                  n = t.get('function', {}).get('name', t.get('name'))
-                  if n: names.append(n)
-          print("clean-machine tool names:", len(names), sorted(names))
-          print("official prompt_cache_key present:", 'prompt_cache_key' in b,
-                "| tool_choice:", b.get('tool_choice'), "| max_output_tokens:", b.get('max_output_tokens'))
-          def post(label, body):
+          names = [t.get('function', {}).get('name', t.get('name')) for t in b['tools']]
+          cads = ["cad-mcp_add_dimension","cad-mcp_audit_drawing","cad-mcp_check_advisory","cad-mcp_check_deliverables","cad-mcp_check_opening","cad-mcp_check_residential","cad-mcp_copy_by_tag","cad-mcp_dim_chain","cad-mcp_draw_arc","cad-mcp_draw_axis_grid","cad-mcp_draw_circle","cad-mcp_draw_compass","cad-mcp_draw_door","cad-mcp_draw_door_set","cad-mcp_draw_ellipse","cad-mcp_draw_furniture","cad-mcp_draw_hatch","cad-mcp_draw_leader","cad-mcp_draw_level","cad-mcp_draw_line","cad-mcp_draw_lwpolyline","cad-mcp_draw_mtext","cad-mcp_draw_polyline","cad-mcp_draw_rectangle","cad-mcp_draw_schedule_table","cad-mcp_draw_stair","cad-mcp_draw_text","cad-mcp_draw_toilet","cad-mcp_draw_wall_run","cad-mcp_draw_window","cad-mcp_erase_by_filter","cad-mcp_export_preview","cad-mcp_insert_block","cad-mcp_mirror_by_tag","cad-mcp_move_by_tag","cad-mcp_open_drawing","cad-mcp_process_command","cad-mcp_query_entities","cad-mcp_redraw_component","cad-mcp_rotate_by_tag","cad-mcp_save_drawing","cad-mcp_scale_by_tag","cad-mcp_setup_dim_style","cad-mcp_setup_layers"]
+          assert len(cads) == 44, len(cads)
+          def post(label, namelist):
               ses = 'ses_' + ''.join(secrets.choice('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(24))
+              body = {"model": "muse-spark-1.3-contributor-free", "stream": True,
+                  "input": [{"role": "user", "content": [{"type": "input_text", "text": "Reply with exactly: PONG"}]}],
+                  "tools": [{"type": "function", "name": n, "description": "probe",
+                             "parameters": {"type": "object", "properties": {}}} for n in namelist]}
               req = urllib.request.Request("https://opencode.ai/zen/v1/responses",
                   data=json.dumps(body).encode(), method="POST", headers={
                   "Authorization": "Bearer public", "Content-Type": "application/json",
@@ -99,17 +97,11 @@ jobs:
                   "X-Opencode-Project": "default", "X-Opencode-Request": "msg_" + secrets.token_hex(6)})
               try:
                   with urllib.request.urlopen(req, timeout=90) as r:
-                      print(label, "GATE_STATUS:", r.status); r.read(200)
+                      print(label, "GATE_STATUS:", r.status, "n=%d" % len(namelist)); r.read(200)
               except Exception as e:
-                  print(label, "GATE_STATUS: FAIL", str(e)[:160])
-          stub = lambda n: {"type": "function", "name": n, "description": "probe",
-                            "parameters": {"type": "object", "properties": {}}}
-          base_input = [{"role": "user", "content": [{"type": "input_text", "text": "Reply with exactly: PONG"}]}]
-          post("R1_clean10_bare", {"model": "muse-spark-1.3-contributor-free", "stream": True,
-              "input": base_input, "tools": [stub(n) for n in names]})
-          post("R2_clean10_official_extras", {"model": "muse-spark-1.3-contributor-free", "stream": True,
-              "store": False, "prompt_cache_key": "ses_" + ''.join(secrets.choice('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(24)),
-              "tool_choice": b.get('tool_choice', 'auto'), "max_output_tokens": b.get('max_output_tokens', 32000),
-              "input": base_input, "tools": [stub(n) for n in names]})
+                  print(label, "GATE_STATUS: FAIL", str(e)[:120], "n=%d" % len(namelist))
+          post("R3_clean10_cadFirst22", names + cads[:22])
+          post("R4_clean10_cadLast22", names + cads[22:])
+          post("R5_clean10_all44cad", names + cads)
           EOF
       - run: kill $(cat mock.pid) || true
