@@ -1,0 +1,91 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - run: go vet ./...
+      - run: go test ./...
+  linux-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - run: go build -trimpath -ldflags '-s -w' -o zen-direct-linux-amd64 .
+      # mock upstream: canned responses envelope for POST, {} for GET /models
+      - run: |
+          cat > mock_up.py <<'EOF'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          import json
+          class H(BaseHTTPRequestHandler):
+              def _send(self, code, obj):
+                  b = json.dumps(obj).encode()
+                  self.send_response(code)
+                  self.send_header('Content-Type', 'application/json')
+                  self.send_header('Content-Length', str(len(b)))
+                  self.end_headers()
+                  self.wfile.write(b)
+              def do_GET(self):
+                  self._send(200, {"data": []})
+              def do_POST(self):
+                  n = int(self.headers.get('Content-Length', 0))
+                  self.rfile.read(n)
+                  self._send(200, {"id": "resp_mock", "status": "completed",
+                      "output": [{"id": "msg_mock", "type": "message", "role": "assistant",
+                                  "content": [{"type": "output_text", "text": "CI-OK"}]}],
+                      "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}})
+              def log_message(self, *a):
+                  pass
+          HTTPServer(('127.0.0.1', 18091), H).serve_forever()
+          EOF
+          nohup python3 mock_up.py > mock.log 2>&1 &
+          echo $! > mock.pid
+      - run: |
+          OPENCODE_ZEN_BASE=http://127.0.0.1:18091 PORT=18080 SHIM_SESSION_FILE=/tmp/ci-pool.json nohup ./zen-direct-linux-amd64 > gw.log 2>&1 &
+          echo $! > gw.pid
+          sleep 2
+          curl -sf http://127.0.0.1:18080/health
+      - run: |
+          curl -sf -X POST http://127.0.0.1:18080/v1/responses \
+            -H 'Content-Type: application/json' \
+            -H 'User-Agent: deepseek-harness/0.1.6' \
+            -d '{"model":"test/muse-spark-1.3-contributor-free","stream":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}' \
+            | grep -q CI-OK
+      - run: |
+          kill $(cat gw.pid) $(cat mock.pid) || true
+          cat gw.log
+  build:
+    needs: [test, linux-smoke]
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            out: zen-direct-linux-amd64
+          - os: windows-latest
+            out: zen-direct.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - run: go build -trimpath -ldflags '-s -w' -o ${{ matrix.out }} .
+        env:
+          CGO_ENABLED: '0'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.out }}
+          path: ${{ matrix.out }}
