@@ -11,97 +11,91 @@ jobs:
         with:
           node-version: '22'
       - run: npm install -g opencode-ai@1.18.31
-      # mock upstream: record request (headers+body), reply canned completed envelope
+      # transparent record-and-forward proxy: opencode -> 18092 -> real zen upstream
       - run: |
-          cat > mock_rec.py <<'EOF'
-          from http.server import BaseHTTPRequestHandler, HTTPServer
-          import json
+          cat > forward_rec.py <<'EOF'
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          import json, shutil, urllib.request
+          UP = "https://opencode.ai/zen/v1"
           class H(BaseHTTPRequestHandler):
-              def _send(self, code, obj):
-                  b = json.dumps(obj).encode()
-                  self.send_response(code)
-                  self.send_header('Content-Type', 'application/json')
-                  self.send_header('Content-Length', str(len(b)))
-                  self.end_headers()
-                  self.wfile.write(b)
-              def do_GET(self):
-                  self._send(200, {"data": []})
-              def do_POST(self):
+              def _fwd(self):
                   n = int(self.headers.get('Content-Length', 0))
-                  raw = self.rfile.read(n)
-                  rec = {"path": self.path,
-                         "headers": {k: v for k, v in self.headers.items()},
-                         "body": json.loads(raw.decode())}
-                  open('recorded.json', 'w').write(json.dumps(rec))
-                  self._send(200, {"id": "resp_mock", "status": "completed",
-                      "output": [{"id": "msg_mock", "type": "message", "role": "assistant",
-                                  "content": [{"type": "output_text", "text": "PROBE-OK"}]}],
-                      "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}})
+                  raw = self.rfile.read(n) if n else b''
+                  if self.command == 'POST':
+                      try:
+                          rec = {"path": self.path,
+                                 "headers": {k: v for k, v in self.headers.items()},
+                                 "body": json.loads(raw.decode())}
+                      except Exception as e:
+                          rec = {"path": self.path, "parse_error": str(e),
+                                 "raw_prefix": raw[:500].decode('utf-8', 'replace')}
+                      open('recorded_full.json', 'w').write(json.dumps(rec))
+                  hdrs = {k: v for k, v in self.headers.items()
+                          if k.lower() not in ('host', 'content-length', 'connection')}
+                  req = urllib.request.Request(UP + self.path, data=raw if self.command == 'POST' else None,
+                                               method=self.command, headers=hdrs)
+                  try:
+                      up = urllib.request.urlopen(req, timeout=120)
+                      self.send_response(up.status)
+                      ct = up.headers.get('Content-Type', 'application/octet-stream')
+                      self.send_header('Content-Type', ct)
+                      self.end_headers()
+                      if self.command == 'POST':
+                          open('gate_status.txt', 'w').write(str(up.status))
+                      shutil.copyfileobj(up, self.wfile, length=65536)
+                  except Exception as e:
+                      code = getattr(e, 'code', 599)
+                      eb = str(e)[:500]
+                      self.send_response(502)
+                      self.send_header('Content-Type', 'text/plain')
+                      self.end_headers()
+                      try:
+                          self.wfile.write(("FORWARDER_UPSTREAM_FAIL %s %s" % (code, eb)).encode())
+                      except Exception:
+                          pass
+                      if self.command == 'POST':
+                          open('gate_status.txt', 'w').write('UPSTREAM_FAIL %s %s' % (code, eb))
+              def do_POST(self):
+                  self._fwd()
+              def do_GET(self):
+                  self._fwd()
               def log_message(self, *a):
                   pass
-          HTTPServer(('127.0.0.1', 18091), H).serve_forever()
+          ThreadingHTTPServer(('127.0.0.1', 18092), H).serve_forever()
           EOF
-          nohup python3 mock_rec.py > mock.log 2>&1 &
-          echo $! > mock.pid
-      # clean-machine opencode config: no MCPs, probe provider -> mock
+          nohup python3 forward_rec.py > fwd.log 2>&1 &
+          echo $! > fwd.pid
+      # clean-machine opencode config: no MCPs, probe provider -> forwarder, apiKey public
       - run: |
           mkdir -p ~/.config/opencode
           cat > ~/.config/opencode/opencode.json <<'EOF'
           {"$schema": "https://opencode.ai/config.json",
            "agent": {"bypass": {"mode": "primary", "permission": {"*": "allow"}}},
            "provider": {"probe": {"npm": "@ai-sdk/openai",
-             "options": {"apiKey": "notneed", "baseURL": "http://127.0.0.1:18091/v1"},
+             "options": {"apiKey": "public", "baseURL": "http://127.0.0.1:18092/v1"},
              "models": {"muse-spark-1.3-contributor-free": {"name": "muse-spark-1.3-contributor-free"}}}}}
           EOF
       - run: |
-          timeout 150 opencode run --pure --agent bypass -m probe/muse-spark-1.3-contributor-free "Reply with exactly: PONG" || echo "RUN_EXIT=$?"
-      # what did clean opencode send?
+          timeout 170 opencode run --pure --agent bypass -m probe/muse-spark-1.3-contributor-free "Reply with exactly: PONG" > run_out.txt 2>&1; echo "RUN_EXIT=$?"
+          tail -c 600 run_out.txt
+      # verdict: what did genuine clean opencode send, and did the gate let it through?
       - run: |
+          echo "=== gate_status ==="; cat gate_status.txt 2>/dev/null || echo "NO GATE STATUS RECORDED"
           python3 - <<'EOF'
           import json
-          rec = json.load(open('recorded.json'))
-          b = rec['body']
+          rec = json.load(open('recorded_full.json'))
+          b = rec.get('body', {})
           print("PATH:", rec['path'])
-          print("REQ_HEADERS:", json.dumps({k: v for k, v in rec['headers'].items() if 'opencode' in k.lower() or 'user-agent' in k.lower() or 'session' in k.lower()}, indent=1))
-          print("BODY_KEYS:", list(b.keys()))
-          tools = b.get('tools', 'ABSENT')
-          if isinstance(tools, list):
-              print("NTOOLS:", len(tools))
-              print("NAMES:", sorted(t.get('function', {}).get('name', t.get('name')) for t in tools))
-          else:
-              print("TOOLS:", tools)
-          print("MODEL:", b.get('model'), "| STREAM:", b.get('stream'), "| STORE:", b.get('store'))
-          print("REASONING:", json.dumps(b.get('reasoning')))
+          hdrs = rec.get('headers', {})
+          print("REQ_HEADERS:", json.dumps({k: v for k, v in hdrs.items()
+                if 'opencode' in k.lower() or 'user-agent' in k.lower()
+                or 'session' in k.lower() or 'authorization' in k.lower()}, indent=1))
+          print("BODY_KEYS:", list(b.keys()) if isinstance(b, dict) else type(b))
+          if isinstance(b, dict) and isinstance(b.get('tools'), list):
+              print("NTOOLS:", len(b['tools']))
+              print("NAMES:", sorted(t.get('function', {}).get('name', t.get('name')) for t in b['tools']))
+              print("STORE:", b.get('store'), "| STREAM:", b.get('stream'),
+                    "| TOOL_CHOICE:", b.get('tool_choice'), "| MAXTOK:", b.get('max_output_tokens'))
+              print("HAS_PROMPT_CACHE_KEY:", 'prompt_cache_key' in b, "| REASONING:", json.dumps(b.get('reasoning')))
           EOF
-      # replay matrix round 3: bisect the 44 cad names.
-      # R3 clean10+cad[:22] | R4 clean10+cad[22:] | R5 clean10+all44
-      - run: |
-          python3 - <<'EOF'
-          import json, secrets, urllib.request
-          rec = json.load(open('recorded.json'))
-          b = rec['body']
-          names = [t.get('function', {}).get('name', t.get('name')) for t in b['tools']]
-          cads = ["cad-mcp_add_dimension","cad-mcp_audit_drawing","cad-mcp_check_advisory","cad-mcp_check_deliverables","cad-mcp_check_opening","cad-mcp_check_residential","cad-mcp_copy_by_tag","cad-mcp_dim_chain","cad-mcp_draw_arc","cad-mcp_draw_axis_grid","cad-mcp_draw_circle","cad-mcp_draw_compass","cad-mcp_draw_door","cad-mcp_draw_door_set","cad-mcp_draw_ellipse","cad-mcp_draw_furniture","cad-mcp_draw_hatch","cad-mcp_draw_leader","cad-mcp_draw_level","cad-mcp_draw_line","cad-mcp_draw_lwpolyline","cad-mcp_draw_mtext","cad-mcp_draw_polyline","cad-mcp_draw_rectangle","cad-mcp_draw_schedule_table","cad-mcp_draw_stair","cad-mcp_draw_text","cad-mcp_draw_toilet","cad-mcp_draw_wall_run","cad-mcp_draw_window","cad-mcp_erase_by_filter","cad-mcp_export_preview","cad-mcp_insert_block","cad-mcp_mirror_by_tag","cad-mcp_move_by_tag","cad-mcp_open_drawing","cad-mcp_process_command","cad-mcp_query_entities","cad-mcp_redraw_component","cad-mcp_rotate_by_tag","cad-mcp_save_drawing","cad-mcp_scale_by_tag","cad-mcp_setup_dim_style","cad-mcp_setup_layers"]
-          assert len(cads) == 44, len(cads)
-          def post(label, namelist):
-              ses = 'ses_' + ''.join(secrets.choice('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(24))
-              body = {"model": "muse-spark-1.3-contributor-free", "stream": True,
-                  "input": [{"role": "user", "content": [{"type": "input_text", "text": "Reply with exactly: PONG"}]}],
-                  "tools": [{"type": "function", "name": n, "description": "probe",
-                             "parameters": {"type": "object", "properties": {}}} for n in namelist]}
-              req = urllib.request.Request("https://opencode.ai/zen/v1/responses",
-                  data=json.dumps(body).encode(), method="POST", headers={
-                  "Authorization": "Bearer public", "Content-Type": "application/json",
-                  "User-Agent": "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
-                  "X-Opencode-Session": ses, "X-Opencode-Client": "opencode",
-                  "X-Opencode-Project": "default", "X-Opencode-Request": "msg_" + secrets.token_hex(6)})
-              try:
-                  with urllib.request.urlopen(req, timeout=90) as r:
-                      print(label, "GATE_STATUS:", r.status, "n=%d" % len(namelist)); r.read(200)
-              except Exception as e:
-                  print(label, "GATE_STATUS: FAIL", str(e)[:120], "n=%d" % len(namelist))
-          post("R3_clean10_cadFirst22", names + cads[:22])
-          post("R4_clean10_cadLast22", names + cads[22:])
-          post("R5_clean10_all44cad", names + cads)
-          EOF
-      - run: kill $(cat mock.pid) || true
+      - run: kill $(cat fwd.pid) || true
