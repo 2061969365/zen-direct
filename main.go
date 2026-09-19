@@ -837,6 +837,23 @@ func main() {
 	if err != nil {
 		log.Fatalf("OPENCODE_ZEN_BASE 非法: %v", err)
 	}
+	// 网关自管日志文件：LOG_FILE 设路径即启用，按 LOG_MAX_MB（默认 200）总量轮转；
+	// 未设则沿用 stderr（旧行为）。自管后不再依赖外部重定向，Hidden 启动不丢日志。
+	if lp := env("LOG_FILE", ""); lp != "" {
+		budget := 200
+		if v := env("LOG_MAX_MB", ""); v != "" {
+			var parsed int
+			if _, err := fmt.Sscanf(v, "%d", &parsed); err == nil && parsed >= 1 {
+				budget = parsed
+			}
+		}
+		if rw, err := newRotateWriter(lp, budget); err != nil {
+			log.Printf("log file %s 打开失败，沿用 stderr: %v", lp, err)
+		} else {
+			log.SetOutput(rw)
+			log.Printf("file logging on: %s budget=%dMB", lp, budget)
+		}
+	}
 	apiKey = env("OPENCODE_ZEN_API_KEY", "public")
 	project = env("OPENCODE_ZEN_PROJECT", "default")
 	seedBuiltinTable()

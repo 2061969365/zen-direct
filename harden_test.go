@@ -806,3 +806,36 @@ func TestForensicsRotate(t *testing.T) {
 		t.Fatalf("应有单备 .bak：%v", err)
 	}
 }
+
+func TestRotateWriterBudget(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "gw.log")
+	w, err := newRotateWriterSized(p, 1024, 3)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		if _, err := w.Write([]byte("0123456789abcdefghijklmnopqrstuvwxyz0123456789\n")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	w.Close()
+	var total int64
+	names := []string{p, p + ".1", p + ".2"}
+	for _, n := range names {
+		fi, err := os.Stat(n)
+		if err != nil {
+			t.Fatalf("缺分片 %s: %v", n, err)
+		}
+		total += fi.Size()
+		if fi.Size() > 1024+64 {
+			t.Fatalf("单片超限 %s=%d", n, fi.Size())
+		}
+	}
+	if total > 1024*3+256 {
+		t.Fatalf("总量超预算: %d", total)
+	}
+	if _, err := os.Stat(p + ".3"); !os.IsNotExist(err) {
+		t.Fatal("最多保留3片，.3 不应存在")
+	}
+}
