@@ -205,19 +205,31 @@ func TestIdleTimeoutFires(t *testing.T) {
 	}
 }
 
-// DONE：正文裸词不误判；真 JSON 终态补 DONE。
+// DONE：正文裸词不误判；真 JSON 终态 / event: 行终态补 DONE。
 func TestDoneQuotedMarkers(t *testing.T) {
-	// 正文含裸词 response.completed 但无 JSON 终态：不补。
+	// 正文含裸词 response.completed（前后无引号）但无终态帧：不补。
 	rec := httptest.NewRecorder()
-	pipeSSE(rec, strings.NewReader("data: {\"text\":\"response.completed appears here\"}\n\n"))
+	pipeSSE(rec, strings.NewReader("data: {\"text\":\"see response.completed docs\"}\n\n"))
 	if strings.Contains(rec.Body.String(), "[DONE]") {
 		t.Fatalf("裸词不得误判终态：%q", rec.Body.String())
 	}
-	// 真终态补 DONE。
+	// 真 JSON 终态补 DONE。
 	rec2 := httptest.NewRecorder()
 	pipeSSE(rec2, strings.NewReader("data: {\"type\":\"response.completed\"}\n\n"))
 	if !strings.Contains(rec2.Body.String(), "[DONE]") {
 		t.Fatalf("真终态应补 DONE：%q", rec2.Body.String())
+	}
+	// 上游主形态 event: 行终态补 DONE。
+	rec3 := httptest.NewRecorder()
+	pipeSSE(rec3, strings.NewReader("event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"))
+	if !strings.Contains(rec3.Body.String(), "[DONE]") {
+		t.Fatalf("event 行终态应补 DONE：%q", rec3.Body.String())
+	}
+	// 上游自带 data: DONE（无空格形态也认）：不重复。
+	rec4 := httptest.NewRecorder()
+	pipeSSE(rec4, strings.NewReader("event: response.completed\ndata: {\"x\":1}\n\ndata:[DONE]\n\n"))
+	if strings.Count(rec4.Body.String(), "[DONE]") != 1 {
+		t.Fatalf("DONE 应恰好一个：%q", rec4.Body.String())
 	}
 }
 

@@ -384,16 +384,24 @@ func pipeSSE(w http.ResponseWriter, r io.Reader) {
 		if len(tail) > 4096 {
 			tail = tail[len(tail)-4096:]
 		}
-		s := string(tail)
-		// 带引号匹配：终态帧是 JSON（"type":"response.completed"），
-		// 模型正文里的裸词 response.completed 不得误判（否则半截流被当正常结束）。
-		if strings.Contains(s, `"response.completed"`) ||
-			strings.Contains(s, `"response.incomplete"`) ||
-			strings.Contains(s, `"response.failed"`) {
-			sawTerminal = true
-		}
-		if strings.Contains(s, "data: [DONE]") {
-			sawDone = true
+		// 行级匹配（上游主形态是 `event: response.completed` 行，data 行为 JSON）。
+		// 裸词匹配已删：模型正文里的 response.completed 不得误判（否则半截流被当正常结束）。
+		for _, ln := range strings.Split(string(tail), "\n") {
+			t := strings.TrimSpace(ln)
+			if strings.HasPrefix(t, "event:") {
+				ev := strings.TrimSpace(strings.TrimPrefix(t, "event:"))
+				if ev == "response.completed" || ev == "response.incomplete" || ev == "response.failed" {
+					sawTerminal = true
+				}
+			}
+			if strings.Contains(t, `"response.completed"`) ||
+				strings.Contains(t, `"response.incomplete"`) ||
+				strings.Contains(t, `"response.failed"`) {
+				sawTerminal = true
+			}
+			if strings.HasPrefix(t, "data:") && strings.Contains(t, "[DONE]") {
+				sawDone = true
+			}
 		}
 	}
 	buf := make([]byte, 32<<10)
