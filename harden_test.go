@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -781,5 +783,26 @@ func TestDiagSwitch(t *testing.T) {
 	diagEnabled = false
 	if diagOn() {
 		t.Fatal("关应为 false")
+	}
+}
+
+func TestForensicsRotate(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "f.log")
+	oldCap := forensicsMaxBytes
+	forensicsMaxBytes = 512
+	defer func() { forensicsMaxBytes = oldCap }()
+	big := map[string]any{"input": []any{map[string]any{"type": "message"}}}
+	// 灌到超 cap：应转出单 .bak 并重写新文件。
+	for i := 0; i < 20; i++ {
+		t.Setenv("DIRECT_400_LOG", p)
+		logForensics("req_x", FmtResponses, "m", "fp_x", big, true)
+	}
+	fi, err := os.Stat(p)
+	if err != nil || fi.Size() > forensicsMaxBytes+512 {
+		t.Fatalf("主文件应有界：size=%v err=%v", fi.Size(), err)
+	}
+	if _, err := os.Stat(p + ".bak"); err != nil {
+		t.Fatalf("应有单备 .bak：%v", err)
 	}
 }

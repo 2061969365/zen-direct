@@ -320,6 +320,10 @@ func passthruUpstreamError(w http.ResponseWriter, reqID string, resp *http.Respo
 // logForensics caller-mismatch 取证落盘：生产 stderr 常丢（Hidden 启动），
 // 下次复发直接看文件即可定位毒条目形状，无需抓包。
 // 路径 DIRECT_400_LOG，缺省 %TEMP%/zen-direct-400s.log。
+// forensicsMaxBytes 取证文件上限（默认 5MB）：超限转单备 .bak 后重写。
+// 取证行只在 400 自愈路径写，正常流量下几乎不涨；上限防极端刷屏。
+var forensicsMaxBytes int64 = 5 << 20
+
 func logForensics(reqID string, entry Format, model, fp string, in map[string]any, healed bool) {
 	path := os.Getenv("DIRECT_400_LOG")
 	if path == "" {
@@ -362,6 +366,9 @@ func logForensics(reqID string, entry Format, model, fp string, in map[string]an
 		"nItems": nItems, "reasoningIDs": ids, "healed": healed,
 	}
 	b, _ := json.Marshal(rec)
+	if fi, err := os.Stat(path); err == nil && fi.Size() >= forensicsMaxBytes {
+		_ = os.Rename(path, path+".bak")
+	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		log.Printf("[REQ %s] forensics write: %v", reqID, err)
