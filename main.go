@@ -111,6 +111,27 @@ func writeErr(w http.ResponseWriter, code int, typ, msg string) {
 var upstream *url.URL
 var apiKey, project string
 
+// maxReqBody 入口体上限（var 供单测覆盖小值）。
+var maxReqBody = 32 << 20
+
+// fwdSem 上游并发门：子弹先飞，内存先算账。
+// 单请求常驻≈body(32M)+解析膨胀(2~3x)+上游体，满载 N 并发≈N×100MB。
+var fwdSem = make(chan struct{}, fwdConcurrency())
+
+func fwdConcurrency() int {
+	n := 8
+	if v := os.Getenv("DIRECT_CONCURRENCY"); v != "" {
+		var parsed int
+		if _, err := fmt.Sscanf(v, "%d", &parsed); err == nil && parsed >= 1 && parsed <= 32 {
+			n = parsed
+		}
+	}
+	return n
+}
+
+// 注：上游包体空闲超时复用 convert_stream.go 的 newIdleTimeoutBody +
+// streamIdleTimeout()（超时直接 Close 打断阻塞 Read），main.go 不另造类型。
+
 var httpClient = &http.Client{
 	Timeout: 0,
 	Transport: &http.Transport{
@@ -141,24 +162,30 @@ func singleJoin(base, p string) string {
 	return strings.TrimSuffix(base, "/") + "/" + strings.TrimPrefix(p, "/")
 }
 
-// normalizeModel 去 provider 前缀：harness 发 provider/model-id（如 test/...），
-// 上游只认裸 model id（实测带前缀 401 Model is not supported）。
+// normalizeModel 去 provider 前缀 + 剥 [1M] 标记 + 去空格。
+// harness 发 provider/model-id（如 test/...），上游只认裸 model id
+// （实测带前缀 401）。大小写保留原样透传上游（上游区分大小写），
+// 路由查表时调用方用小写另查。
 func normalizeModel(in map[string]any) {
 	m, _ := in["model"].(string)
-	if i := strings.Index(m, "/"); i >= 0 {
-		in["model"] = m[i+1:]
+	m = stripOneMSuffix(m)
+	if i := strings.LastIndex(m, "/"); i >= 0 {
+		m = m[i+1:]
 	}
+	in["model"] = m
 }
 
 func isOfficialUA(ua string) bool { return strings.HasPrefix(ua, "opencode/") }
 
 // fpForEntry 下游会话键：X-Session-Id 头优先；无头按入口格式取首文本+instructions/system。
-func fpForEntry(entry Format, h http.Header, in map[string]any) string {
+// keyed=false 表示无法定键（空体/首条非文本）：调用方不得进池（防多会话同键
+// 串 caller），走“每请求现签 + 首见剥离”安全默认。
+func fpForEntry(entry Format, h http.Header, in map[string]any) (string, bool) {
 	if sid := strings.TrimSpace(h.Get("X-Session-Id")); sid != "" {
-		return fpKey(sid, "", "")
+		return fpKey(sid, "", ""), true
 	}
 	if sid := strings.TrimSpace(h.Get("x-session-affinity")); sid != "" {
-		return fpKey(sid, "", "")
+		return fpKey(sid, "", ""), true
 	}
 	ins, _ := in["instructions"].(string)
 	sys, _ := in["system"].(string)
@@ -174,16 +201,31 @@ func fpForEntry(entry Format, h http.Header, in map[string]any) string {
 			first = textOfContent(m["content"])
 		}
 	}
-	return fpKey("", first, ins+sys)
+	if strings.TrimSpace(first) == "" {
+		return "", false
+	}
+	return fpKey("", first, ins+sys), true
 }
 
 // forwardResponses 通用入口：entry 格式由 path 定，上游格式由模型表定。
 // responses 直连注桩；chat 双向转换；messages 直接 400（未探明，不裸奔）。
 func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	reqID := "resp_dir_" + randHex(6)
-	raw, err := io.ReadAll(io.LimitReader(req.Body, 32<<20))
+	// 并发门在读体之前：排队请求不抱 32MB（先读后抢=内存放大器）。
+	select {
+	case fwdSem <- struct{}{}:
+		defer func() { <-fwdSem }()
+	case <-req.Context().Done():
+		writeErr(w, 499, "client_closed", "client closed while queued")
+		return
+	}
+	raw, err := io.ReadAll(io.LimitReader(req.Body, int64(maxReqBody)+1))
 	if err != nil {
 		writeErr(w, 400, "invalid_request_error", "read body: "+err.Error())
+		return
+	}
+	if len(raw) > maxReqBody {
+		writeErr(w, 413, "invalid_request_error", "request body too large")
 		return
 	}
 	var in map[string]any
@@ -197,7 +239,8 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	}
 	normalizeModel(in)
 	model, _ := in["model"].(string)
-	target, ok := lookupFormat(model)
+	// 路由查表用小写，透传上游保留原大小写。
+	target, ok := lookupFormat(strings.ToLower(model))
 	if !ok {
 		target = FmtResponses // 未知模型默认 responses 透传（现行行为）
 	}
@@ -207,15 +250,24 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	}
 	stream, _ := in["stream"].(bool)
 
-	// 会话池：官方 UA 且自带真 session 不动；其余配池稳定 session。
-	// （opencode 自带 x-session-id 真会话，透传即同一 caller；harness 无头，配池。）
-	official := isOfficialUA(req.Header.Get("User-Agent")) && req.Header.Get("X-Opencode-Session") != ""
+	// 会话池：官方 UA（opencode 本体）一律直通——不进池、不剥离。
+	// 自带真 session 即同一 caller；无头首轮也不进池（误剥自己的首轮回放
+	// 比什么都贵）。其余（harness）配池稳定 session。
+	// 无键请求（fpForEntry keyed=false）不进池：现签 + 首见剥离。
+	official := isOfficialUA(req.Header.Get("User-Agent"))
 	var fp, poolSes string
 	var isNewFP bool
+	usePool := false
 	if !official {
-		fp = fpForEntry(entry, req.Header, in)
-		poolSes, isNewFP = poolBorrowEx(fp)
-		// C 案兜底：首见 fp 的外来 blob 必为别处签发，剥 blob 留文本。
+		var keyed bool
+		fp, keyed = fpForEntry(entry, req.Header, in)
+		if keyed {
+			usePool = true
+			poolSes, isNewFP = poolBorrowEx(fp)
+		} else {
+			// 无键=无法定 lineage，按首见处理（剥离开），但不入库。
+			isNewFP = true
+		}
 		if entry == FmtResponses {
 			stripForeignBlobs(in, isNewFP)
 		}
@@ -249,31 +301,38 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	}
 
 	upSes := ""
-	if !official {
+	if usePool {
 		upSes = poolSes
 	}
+	// 上游包体空闲超时：首字节后 stall 即掐（防半截流钉死 handler）。
+	// 超时直接 Close 上游体打断阻塞 Read（见 newIdleTimeoutBody）。
+	streamIdle := streamIdleTimeout()
 	resp, err := doUpstream(upSes)
 	if err != nil {
 		writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
 		return
 	}
-	// 池 session 401/403：驱逐并同请求重试一次（新签 session，body 不变）。
-	if (resp.StatusCode == 401 || resp.StatusCode == 403) && fp != "" {
+	// 池 session 401/403：原子轮换并同请求重试一次（新签 session，body 不变）。
+	if (resp.StatusCode == 401 || resp.StatusCode == 403) && usePool {
 		resp.Body.Close()
-		log.Printf("[REQ %s] pooled session expired, evict and retry once", reqID)
-		poolEvict(fp)
-		poolSes, _ = poolBorrowEx(fp)
+		log.Printf("[REQ %s] pooled session expired, rotate and retry once", reqID)
+		poolSes, _ = poolRotate(fp)
 		resp, err = doUpstream(poolSes)
 		if err != nil {
 			writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
 			return
 		}
 	}
-	defer resp.Body.Close()
+	ir := newIdleTimeoutBody(resp.Body, streamIdle)
+	defer ir.Close()
 	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		b, _ := io.ReadAll(io.LimitReader(ir, 256<<10))
 		log.Printf("[REQ %s] upstream %d: %.300s", reqID, resp.StatusCode, string(b))
-		w.Header().Set("Content-Type", "application/json")
+		if ct := resp.Header.Get("Content-Type"); ct != "" {
+			w.Header().Set("Content-Type", ct)
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(b)
 		return
@@ -281,22 +340,22 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	if stream {
 		// 同格式 responses 直传；跨格式走转换（DONE 语义由各转换函数保证）。
 		if entry == FmtResponses && target == FmtResponses {
-			pipeSSE(w, resp.Body)
+			pipeSSE(w, ir)
 			return
 		}
 		if entry == FmtChat && target == FmtResponses {
-			streamResponsesToChat(w, resp.Body, model)
+			streamResponsesToChat(w, ir, model)
 			return
 		}
 		if entry == FmtResponses && target == FmtChat {
-			streamChatToResponses(w, resp.Body, model)
+			streamChatToResponses(w, ir, model)
 			return
 		}
-		pipeSSE(w, resp.Body)
+		pipeSSE(w, ir)
 		return
 	}
 	var upResp map[string]any
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&upResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(ir, 64<<20)).Decode(&upResp); err != nil {
 		writeErr(w, 502, "upstream_error", "decode upstream response: "+err.Error())
 		return
 	}
@@ -322,16 +381,18 @@ func pipeSSE(w http.ResponseWriter, r io.Reader) {
 	sawTerminal, sawDone := false, false
 	note := func(p []byte) {
 		tail = append(tail, p...)
-		if len(tail) > 256 {
-			tail = tail[len(tail)-256:]
+		if len(tail) > 4096 {
+			tail = tail[len(tail)-4096:]
 		}
 		s := string(tail)
-		if strings.Contains(s, "response.completed") ||
-			strings.Contains(s, "response.incomplete") ||
-			strings.Contains(s, "response.failed") {
+		// 带引号匹配：终态帧是 JSON（"type":"response.completed"），
+		// 模型正文里的裸词 response.completed 不得误判（否则半截流被当正常结束）。
+		if strings.Contains(s, `"response.completed"`) ||
+			strings.Contains(s, `"response.incomplete"`) ||
+			strings.Contains(s, `"response.failed"`) {
 			sawTerminal = true
 		}
-		if strings.Contains(s, "[DONE]") {
+		if strings.Contains(s, "data: [DONE]") {
 			sawDone = true
 		}
 	}
@@ -397,5 +458,13 @@ func main() {
 
 	addr := ":" + env("PORT", "8080")
 	log.Printf("zen-direct listening %s upstream %s", addr, upstream.String())
-	log.Fatal(http.ListenAndServe(addr, mux))
+	// WriteTimeout 不设：SSE 流可长达数分钟，写超时会掐正常流。
+	// 空闲超时 + 读头超时防慢连接占 handler。
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }

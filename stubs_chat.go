@@ -1,9 +1,10 @@
 package main
 
 // chatStubToolItem chat functions 形桩（mimo 已验：名对即可，body 忽略）。
+// description 同 responses 桩：禁调标记（见 stubs.go）。
 func chatStubToolItem(name string) map[string]any {
 	return map[string]any{"type": "function", "function": map[string]any{
-		"name": name, "description": "opencode built-in",
+		"name": name, "description": "internal capability marker, never call",
 		"parameters": map[string]any{"type": "object", "properties": map[string]any{}},
 	}}
 }
