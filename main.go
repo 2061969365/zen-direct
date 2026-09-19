@@ -140,7 +140,25 @@ var httpClient = &http.Client{
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   20,
 		ResponseHeaderTimeout: 60 * time.Second,
+		// 代理/VPN 常静默掐空闲 keep-alive（对端 RST/半开），池里陈连接复用即
+		// unexpected EOF。用比缺省更短的空闲上限，宁可多建连，不复用僵尸连接。
+		IdleConnTimeout: 60 * time.Second,
 	},
+}
+
+// isTransportRetryable 上游传输层失败是否值得同请求重试一次。
+// 只认“连接没建成就断”的错（无响应字节，无服务端状态可言）；
+// DNS/代理配置错、超时类一律不重试（重试也一样的结果，还多烧一次）。
+func isTransportRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "unexpected eof") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "forcibly closed") || // Windows 版的 RST：An existing connection was forcibly closed...
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, " eof")
 }
 
 func forwardModels(w http.ResponseWriter, req *http.Request) {
@@ -415,6 +433,12 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		if entry == FmtResponses {
 			stripForeignBlobs(in, isNewFP)
 		}
+		// 池命中（strip 被跳过）：只剥记名毒 id，其余原样保 lineage。
+		if usePool && !isNewFP && entry == FmtResponses {
+			if n := stripKnownBadIDs(in); n > 0 && debugOn() {
+				log.Printf("[REQ %s] debug stripKnownBad=%d", reqID, n)
+			}
+		}
 	}
 
 	buildBody := func() []byte {
@@ -454,6 +478,13 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	// 超时直接 Close 上游体打断阻塞 Read（见 newIdleTimeoutBody）。
 	streamIdle := streamIdleTimeout()
 	resp, err := doUpstream(upSes, upBody)
+	// 传输层失败（建连即断，无响应字节）同请求重试一次：
+	// zen 经本地代理时对端 RST/EOF 是常态，重试一次多半就通；
+	// 写下游字节前判定，流/非流皆安全，且仅一次。
+	if err != nil && isTransportRetryable(err) {
+		log.Printf("[REQ %s] transport error, retry once: %.150s", reqID, err.Error())
+		resp, err = doUpstream(upSes, upBody)
+	}
 	if err != nil {
 		writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
 		return
@@ -478,6 +509,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		resp.Body.Close()
 		if isCallerMismatch(bpeek) {
 			log.Printf("[REQ %s] caller-mismatch, rotate+strip and retry once", reqID)
+			learnBadIDs(collectReasoningIDs(in)) // 实锤毒 id 入负缓存，下轮命中路径先行剥离，免每轮交 400 税。
 			poolSes, _ = poolRotate(fp)
 			stripForeignBlobs(in, true)
 			upBody = buildBody()
@@ -517,7 +549,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	if stream {
 		// 同格式 responses 直传；跨格式走转换（DONE 语义由各转换函数保证）。
 		if entry == FmtResponses && target == FmtResponses {
-			pipeSSE(w, ir)
+			pipeSSE(w, ir, reqID, model)
 			return
 		}
 		if entry == FmtChat && target == FmtResponses {
@@ -528,7 +560,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 			streamChatToResponses(w, ir, model)
 			return
 		}
-		pipeSSE(w, ir)
+		pipeSSE(w, ir, reqID, model)
 		return
 	}
 	var upResp map[string]any
@@ -547,7 +579,13 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 }
 
 // pipeSSE 同格式流原样透传（DONE 补齐语义保留）。
-func pipeSSE(w http.ResponseWriter, r io.Reader) {
+// reqID/model 仅用于收尾日志与 abnormal failed 帧。
+// 正常结束（见终态）：缺 DONE 则补；异常结束（无终态即 EOF/超时）：
+// 发 response.failed（code+type 双写，pi-ai 只读 code）再补 DONE——
+// 下游从“ended before terminal”UNKNOWN 变为可分类错误
+// （harness 走 TIMEOUT/TRANSPORT 重试），不再静默挂起。
+func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string) {
+	start := time.Now()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	fl, _ := w.(http.Flusher)
@@ -555,15 +593,20 @@ func pipeSSE(w http.ResponseWriter, r io.Reader) {
 	// 有终态无 DONE 时由网关补一个，SSE 客户端才能干净结束；
 	// 无终态（半截流）绝不补，沿用“不断言完成”语义。
 	var tail []byte
+	var overlap []byte // 上一块尾部 256B：终态标记被读边界切开时靠它续接。
 	sawTerminal, sawDone := false, false
 	note := func(p []byte) {
 		tail = append(tail, p...)
 		if len(tail) > 4096 {
 			tail = tail[len(tail)-4096:]
 		}
+		// 粘性标记必须扫“重叠+新块”，不能只扫滑动窗口：
+		// completed 体回显 57 桩 tools（8KB+ 单行）时，标记远在窗口之外，
+		// 只扫窗口=标记被挤出=把成功流误判为半截流（shadow 实测误报）。
+		scan := string(append(append([]byte{}, overlap...), p...))
 		// 行级匹配（上游主形态是 `event: response.completed` 行，data 行为 JSON）。
 		// 裸词匹配已删：模型正文里的 response.completed 不得误判（否则半截流被当正常结束）。
-		for _, ln := range strings.Split(string(tail), "\n") {
+		for _, ln := range strings.Split(scan, "\n") {
 			t := strings.TrimSpace(ln)
 			if strings.HasPrefix(t, "event:") {
 				ev := strings.TrimSpace(strings.TrimPrefix(t, "event:"))
@@ -580,24 +623,60 @@ func pipeSSE(w http.ResponseWriter, r io.Reader) {
 				sawDone = true
 			}
 		}
+		if len(tail) > 256 {
+			overlap = tail[len(tail)-256:]
+		} else {
+			overlap = tail
+		}
 	}
 	buf := make([]byte, 32<<10)
+	var nBytes int64
+	var upErr, downErr error
 	for {
 		n, rerr := r.Read(buf)
 		if n > 0 {
+			nBytes += int64(n)
 			note(buf[:n])
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
+				downErr = werr
+				break
 			}
 			if fl != nil {
 				fl.Flush()
 			}
 		}
 		if rerr != nil {
+			if rerr != io.EOF {
+				upErr = rerr
+			}
 			break
 		}
 	}
+	timedOut := false
+	if ib, ok := r.(*idleTimeoutBody); ok && ib.wasTimeout() {
+		timedOut = true
+	}
+	log.Printf("[REQ %s] stream end bytes=%d terminal=%v done=%v upErr=%v downErr=%v ms=%d",
+		reqID, nBytes, sawTerminal, sawDone, upErr, downErr, time.Since(start).Milliseconds())
+	if downErr != nil {
+		return // 下游已死，补帧无意义，只留日志。
+	}
 	if sawTerminal && !sawDone {
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+		return
+	}
+	if !sawTerminal {
+		msg, code := "upstream stream ended without terminal event", "upstream_truncated"
+		if timedOut {
+			msg, code = "upstream idle timeout", "upstream_timeout"
+		}
+		fb, _ := json.Marshal(map[string]any{"type": "response.failed",
+			"response": map[string]any{"id": reqID, "model": model, "status": "failed",
+				"error": map[string]any{"message": msg, "type": code, "code": code}}})
+		_, _ = io.WriteString(w, "event: response.failed\ndata: "+string(fb)+"\n\n")
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 		if fl != nil {
 			fl.Flush()
