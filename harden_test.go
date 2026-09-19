@@ -216,7 +216,7 @@ func TestIdleTimeoutFires(t *testing.T) {
 func TestDoneQuotedMarkers(t *testing.T) {
 	// 正文含裸词 response.completed（前后无引号）但无终态帧：发 failed + DONE，不静默。
 	rec := httptest.NewRecorder()
-	pipeSSE(rec, strings.NewReader("data: {\"text\":\"see response.completed docs\"}\n\n"), "req_t1", "m")
+	pipeSSE(rec, strings.NewReader("data: {\"text\":\"see response.completed docs\"}\n\n"), "req_t1", "m", 0)
 	body := rec.Body.String()
 	if !strings.Contains(body, "response.failed") {
 		t.Fatalf("无终态应发 failed：%q", body)
@@ -229,7 +229,7 @@ func TestDoneQuotedMarkers(t *testing.T) {
 	}
 	// 真 JSON 终态补 DONE，且不发 failed。
 	rec2 := httptest.NewRecorder()
-	pipeSSE(rec2, strings.NewReader("data: {\"type\":\"response.completed\"}\n\n"), "req_t2", "m")
+	pipeSSE(rec2, strings.NewReader("data: {\"type\":\"response.completed\"}\n\n"), "req_t2", "m", 0)
 	if !strings.Contains(rec2.Body.String(), "[DONE]") {
 		t.Fatalf("真终态应补 DONE：%q", rec2.Body.String())
 	}
@@ -238,13 +238,13 @@ func TestDoneQuotedMarkers(t *testing.T) {
 	}
 	// 上游主形态 event: 行终态补 DONE。
 	rec3 := httptest.NewRecorder()
-	pipeSSE(rec3, strings.NewReader("event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"), "req_t3", "m")
+	pipeSSE(rec3, strings.NewReader("event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"), "req_t3", "m", 0)
 	if !strings.Contains(rec3.Body.String(), "[DONE]") {
 		t.Fatalf("event 行终态应补 DONE：%q", rec3.Body.String())
 	}
 	// 上游自带 data: DONE（无空格形态也认）：不重复。
 	rec4 := httptest.NewRecorder()
-	pipeSSE(rec4, strings.NewReader("event: response.completed\ndata: {\"x\":1}\n\ndata:[DONE]\n\n"), "req_t4", "m")
+	pipeSSE(rec4, strings.NewReader("event: response.completed\ndata: {\"x\":1}\n\ndata:[DONE]\n\n"), "req_t4", "m", 0)
 	if strings.Count(rec4.Body.String(), "[DONE]") != 1 {
 		t.Fatalf("DONE 应恰好一个：%q", rec4.Body.String())
 	}
@@ -416,7 +416,7 @@ func TestShortStr(t *testing.T) {
 
 func TestPipeSSEFailedHasCode(t *testing.T) {
 	rec := httptest.NewRecorder()
-	pipeSSE(rec, strings.NewReader("data: {\"a\":1}\n\n"), "req_fc", "mm")
+	pipeSSE(rec, strings.NewReader("data: {\"a\":1}\n\n"), "req_fc", "mm", 0)
 	if !strings.Contains(rec.Body.String(), `"code":"upstream_truncated"`) {
 		t.Fatalf("failed缺code: %q", rec.Body.String())
 	}
@@ -428,7 +428,7 @@ func TestPipeSSEIdleTimeoutMsg(t *testing.T) {
 	defer ir.Close()
 	defer pw.Close()
 	rec := httptest.NewRecorder()
-	pipeSSE(rec, ir, "req_to", "mm")
+	pipeSSE(rec, ir, "req_to", "mm", 0)
 	if !strings.Contains(rec.Body.String(), "upstream idle timeout") {
 		t.Fatalf("stall应报timeout failed: %q", rec.Body.String())
 	}
@@ -482,7 +482,7 @@ func TestPipeSSEFarTerminal(t *testing.T) {
 	pad := strings.Repeat("x", 9000)
 	body := "data: {\"type\":\"response.completed\"}\n\ndata: {\"pad\":\"" + pad + "\"}\n\n"
 	rec := httptest.NewRecorder()
-	pipeSSE(rec, strings.NewReader(body), "req_far", "mm")
+	pipeSSE(rec, strings.NewReader(body), "req_far", "mm", 0)
 	out := rec.Body.String()
 	if strings.Contains(out, "response.failed") {
 		t.Fatalf("远端标记不得误报 failed: %.200s", out)
@@ -547,7 +547,7 @@ func TestTransportRetryOnce(t *testing.T) {
 func TestPipeSSESwallowsPartial(t *testing.T) {
 	rec := httptest.NewRecorder()
 	// 半截行：无换行结尾、无终态 → 下游不得见到半截 data:，只见 failed+DONE。
-	pipeSSE(rec, strings.NewReader("data: {\"type\":\"response.output_text.del"), "req_part", "m")
+	pipeSSE(rec, strings.NewReader("data: {\"type\":\"response.output_text.del"), "req_part", "m", 0)
 	body := rec.Body.String()
 	if strings.Contains(body, "output_text.del") {
 		t.Fatalf("半截行被透传下游: %.200s", body)
@@ -692,5 +692,94 @@ func TestNonStreamStripsEchoedTools(t *testing.T) {
 	}
 	if !strings.Contains(body, "hi") {
 		t.Fatalf("正文丢失: %.300s", body)
+	}
+}
+
+func TestRetry502Once(t *testing.T) {
+	defer cbReset()
+	oldBO := retry502Backoff
+	retry502Backoff = time.Millisecond
+	defer func() { retry502Backoff = oldBO }()
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(502)
+			_, _ = w.Write([]byte(`{"error":"flaky"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"r2","status":"completed","output":[],"usage":{"total_tokens":1}}`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	old := upstream
+	upstream = u
+	defer func() { upstream = old }()
+	code, body := postResponses(t, "http://x", `{"model":"m","stream":false,"input":"hi"}`)
+	if code != 200 {
+		t.Fatalf("502重试后应200: %d body=%.200s", code, body)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("应恰好上游2次: %d", calls.Load())
+	}
+}
+
+func TestNoRetryOn500(t *testing.T) {
+	defer cbReset()
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(500)
+		_, _ = w.Write([]byte(`{"error":"dead"}`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	old := upstream
+	upstream = u
+	defer func() { upstream = old }()
+	code, _ := postResponses(t, "http://x", `{"model":"m","stream":false,"input":"hi"}`)
+	if code != 500 {
+		t.Fatalf("500应透传不重试: %d", code)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("500不得重试，上游应恰1次: %d", calls.Load())
+	}
+}
+
+func TestStatsCounters(t *testing.T) {
+	statsReset()
+	statsAddReq()
+	statsAddReq()
+	statsAddTransportRetry()
+	statsAddFlakyRetry()
+	statsAddUpstream(502)
+	statsAddUpstream(400)
+	statsAddCircuitOpen()
+	statsAddTTFB(100)
+	statsAddTTFB(200)
+	statsAddTTFB(300)
+	s := statsSnapshot()
+	if s.Reqs != 2 || s.TransportRetry != 1 || s.FlakyRetry != 1 || s.Up5xx != 1 || s.Up4xx != 1 || s.CircuitOpens != 1 {
+		t.Fatalf("计数错位: %+v", s)
+	}
+	if s.TTFBP50 != 200 || s.TTFBP95 != 300 {
+		t.Fatalf("分位错: p50=%d p95=%d", s.TTFBP50, s.TTFBP95)
+	}
+	statsReset()
+	if s := statsSnapshot(); s.Reqs != 0 {
+		t.Fatal("reset 应清零")
+	}
+}
+
+func TestDiagSwitch(t *testing.T) {
+	old := diagEnabled
+	defer func() { diagEnabled = old }()
+	diagEnabled = true
+	if !diagOn() {
+		t.Fatal("开应为 true")
+	}
+	diagEnabled = false
+	if diagOn() {
+		t.Fatal("关应为 false")
 	}
 }

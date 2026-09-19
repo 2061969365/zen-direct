@@ -373,11 +373,18 @@ func logForensics(reqID string, entry Format, model, fp string, in map[string]an
 
 // forwardResponses 通用入口：entry 格式由 path 定，上游格式由模型表定。
 // responses 直连注桩；chat 双向转换；messages 直接 400（未探明，不裸奔）。
+// retry502Backoff 502/503 重试退避（包级变量，单测可覆盖成毫秒级）。
+var retry502Backoff = 1500 * time.Millisecond
+
 func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	reqID := "resp_dir_" + randHex(6)
+	reqStart := time.Now()
+	// ttfbMs 首轮响应头耗时（连接健康的最直接信号）；重试不覆盖。
+	var ttfbMs int64
 	// 熔断开直接 fast-fail：不占槽、不打上游（风暴时减负）。
 	if !cbAllow() {
 		log.Printf("[REQ %s] circuit open, fast-fail 502", reqID)
+		statsAddCircuitOpen()
 		writeErr(w, 502, "circuit_open", "upstream circuit open, retry later")
 		return
 	}
@@ -391,6 +398,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		return
 	}
 	waitMs := time.Since(waitStart).Milliseconds()
+	statsAddReq()
 	raw, err := io.ReadAll(io.LimitReader(req.Body, int64(maxReqBody)+1))
 	if err != nil {
 		writeErr(w, 400, "invalid_request_error", "read body: "+err.Error())
@@ -468,14 +476,14 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	}
 	log.Printf("[REQ %s] in=%s model=%s target=%s stream=%v official=%v fp=%s ses=%s new=%v upBytes=%d waitMs=%d",
 		reqID, entry, model, target, stream, official, shortStr(fp, 16), shortStr(poolSes, 20), isNewFP, len(upBody), waitMs)
-		if len(upBody) > 1<<20 {
-			var nItems int
-			if arr, ok := in["input"].([]any); ok {
-				nItems = len(arr)
-			}
-			log.Printf("[REQ %s] WARN huge upstream body bytes=%d nItems=%d", reqID, len(upBody), nItems)
+	if diagOn() && len(upBody) > 1<<20 {
+		var nItems int
+		if arr, ok := in["input"].([]any); ok {
+			nItems = len(arr)
 		}
-	if debugOn() {
+		log.Printf("[REQ %s] WARN huge upstream body bytes=%d nItems=%d", reqID, len(upBody), nItems)
+	}
+	if debugOn() && diagOn() {
 		ids := collectReasoningIDs(in)
 		log.Printf("[REQ %s] debug reasoningIDs=%v", reqID, ids)
 		n := len(upBody)
@@ -494,7 +502,14 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		if ses != "" {
 			fwd.Header.Set("X-Opencode-Session", ses)
 		}
-		return httpClient.Do(fwd)
+		// 首字节计时：Do 在响应头到达后返回，即 TTFB；只采首轮（重试不覆盖）。
+		t0 := time.Now()
+		resp, err := httpClient.Do(fwd)
+		if ttfbMs == 0 {
+			ttfbMs = time.Since(t0).Milliseconds()
+			statsAddTTFB(ttfbMs)
+		}
+		return resp, err
 	}
 
 	upSes := ""
@@ -510,6 +525,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	// 写下游字节前判定，流/非流皆安全，且仅一次。
 	if err != nil && isTransportRetryable(err) {
 		log.Printf("[REQ %s] transport error, retry once: %.150s", reqID, err.Error())
+		statsAddTransportRetry()
 		resp, err = doUpstream(upSes, upBody)
 	}
 	if err != nil {
@@ -560,10 +576,31 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 			return
 		}
 	}
+	// 上游 502/503 瞬时抖：退避重发一次（写下游字节前，流/非流皆安全）。
+	// 500 不碰（模型真失败，重试纯烧钱）；429 不碰（限流越冲越死）。
+	// 注意：自愈分支的 400 重试若撞上 502/503，会落到这里再重试一次（最多 3 次上游调用）。
+	if resp.StatusCode == 502 || resp.StatusCode == 503 {
+		log.Printf("[REQ %s] upstream %d flaky, backoff retry once", reqID, resp.StatusCode)
+		statsAddFlakyRetry()
+		resp.Body.Close()
+		select {
+		case <-time.After(retry502Backoff):
+		case <-req.Context().Done():
+			writeErr(w, 499, "client_closed", "client closed during retry backoff")
+			return
+		}
+		resp, err = doUpstream(upSes, upBody)
+		if err != nil {
+			evictIfNewFP()
+			writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
+			return
+		}
+	}
 	ir := newIdleTimeoutBody(resp.Body, streamIdle)
 	defer ir.Close()
 	if resp.StatusCode != 200 {
 		cbRecord(resp.StatusCode) // 只计 5xx；4xx（门禁/毒串）是请求问题，不熔断。
+		statsAddUpstream(resp.StatusCode)
 		evictIfNewFP()
 		b, _ := io.ReadAll(io.LimitReader(ir, 256<<10))
 		log.Printf("[REQ %s] upstream %d: %.300s", reqID, resp.StatusCode, string(b))
@@ -580,7 +617,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	if stream {
 		// 同格式 responses 直传；跨格式走转换（DONE 语义由各转换函数保证）。
 		if entry == FmtResponses && target == FmtResponses {
-			pipeSSE(w, ir, reqID, model)
+			pipeSSE(w, ir, reqID, model, ttfbMs)
 			return
 		}
 		if entry == FmtChat && target == FmtResponses {
@@ -591,7 +628,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 			streamChatToResponses(w, ir, model)
 			return
 		}
-		pipeSSE(w, ir, reqID, model)
+		pipeSSE(w, ir, reqID, model, ttfbMs)
 		return
 	}
 	var upResp map[string]any
@@ -613,7 +650,10 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		out = chatToResponsesResp(upResp, model)
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(out)
+	outBytes, _ := json.Marshal(out)
+	log.Printf("[REQ %s] non-stream done ttfbMs=%d ms=%d outBytes=%d",
+		reqID, ttfbMs, time.Since(reqStart).Milliseconds(), len(outBytes))
+	_, _ = w.Write(outBytes)
 }
 
 // pipeSSE 同格式流原样透传（DONE 补齐语义保留）。
@@ -651,7 +691,7 @@ func stripCompletedToolsLine(line []byte) []byte {
 	return append(append([]byte("data: "), out...), '\n')
 }
 
-func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string) {
+func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int64) {
 	start := time.Now()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -751,8 +791,8 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string) {
 	if ib, ok := r.(*idleTimeoutBody); ok && ib.wasTimeout() {
 		timedOut = true
 	}
-	log.Printf("[REQ %s] stream end bytes=%d terminal=%v done=%v upErr=%v downErr=%v ms=%d",
-		reqID, nBytes, sawTerminal, sawDone, upErr, downErr, time.Since(start).Milliseconds())
+	log.Printf("[REQ %s] stream end bytes=%d terminal=%v done=%v upErr=%v downErr=%v ttfbMs=%d ms=%d",
+		reqID, nBytes, sawTerminal, sawDone, upErr, downErr, ttfbMs, time.Since(start).Milliseconds())
 	if downErr != nil {
 		return // 下游已死，补帧无意义，只留日志。
 	}
@@ -794,11 +834,18 @@ func main() {
 	project = env("OPENCODE_ZEN_PROJECT", "default")
 	seedBuiltinTable()
 	poolLoad()
+	if diagOn() {
+		go statsReporter(5 * time.Minute)
+	} else {
+		log.Printf("diagnostics off (DIRECT_DIAG=0): no [STATS]/WARN/debug lines")
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"status":"ok","mode":"direct"}`)
+		s := statsSnapshot()
+		fmt.Fprintf(w, `{"status":"ok","mode":"direct","stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d}}`,
+			s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != "GET" {
