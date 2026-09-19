@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -207,6 +208,104 @@ func fpForEntry(entry Format, h http.Header, in map[string]any) (string, bool) {
 	return fpKey("", first, ins+sys), true
 }
 
+// isCallerMismatch 上游 400 是否“签发 caller 不一致”（毒串回放）。
+// 措辞三代：was not issued to this caller / not found or has expired / was not issued。
+func isCallerMismatch(body []byte) bool {
+	s := strings.ToLower(string(body))
+	return strings.Contains(s, "was not issued to this caller") ||
+		strings.Contains(s, "not found or has expired") ||
+		strings.Contains(s, "was not issued")
+}
+
+// buildUpstream 入口 -> 上游转换 + 注桩（自愈重试需重建 body，抽出复用）。
+func buildUpstream(entry Format, target Format, in map[string]any) map[string]any {
+	upReq := in
+	if entry == FmtChat && target == FmtResponses {
+		upReq = chatToResponsesReq(in)
+	} else if entry == FmtResponses && target == FmtChat {
+		upReq = responsesToChatReq(in)
+	}
+	if target == FmtResponses {
+		mergeStubTools(upReq)
+	} else {
+		mergeChatStubTools(upReq)
+	}
+	return upReq
+}
+
+// writeBodyWithType 透传已读的上游错误体（保留原 Content-Type）。
+func writeBodyWithType(w http.ResponseWriter, resp *http.Response, status int, b []byte) {	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(b)
+}
+
+// passthruUpstreamError 上游非 200 读体透传（idle 包裹，截断 256KB）。
+func passthruUpstreamError(w http.ResponseWriter, reqID string, resp *http.Response, idle time.Duration) {
+	ir := newIdleTimeoutBody(resp.Body, idle)
+	defer ir.Close()
+	b, _ := io.ReadAll(io.LimitReader(ir, 256<<10))
+	log.Printf("[REQ %s] upstream %d: %.300s", reqID, resp.StatusCode, string(b))
+	writeBodyWithType(w, resp, resp.StatusCode, b)
+}
+
+// logForensics caller-mismatch 取证落盘：生产 stderr 常丢（Hidden 启动），
+// 下次复发直接看文件即可定位毒条目形状，无需抓包。
+// 路径 DIRECT_400_LOG，缺省 %TEMP%/zen-direct-400s.log。
+func logForensics(reqID string, entry Format, model, fp string, in map[string]any, healed bool) {
+	path := os.Getenv("DIRECT_400_LOG")
+	if path == "" {
+		path = filepath.Join(os.TempDir(), "zen-direct-400s.log")
+	}
+	ids := []string{}
+	nItems := 0
+	if items, ok := in["input"].([]any); ok {
+		nItems = len(items)
+		for _, raw := range items {
+			m, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if m["type"] == "reasoning" {
+				if id, _ := m["id"].(string); id != "" && len(ids) < 8 {
+					ids = append(ids, id)
+				}
+			}
+			if content, ok := m["content"].([]any); ok {
+				for _, p := range content {
+					pm, ok := p.(map[string]any)
+					if !ok {
+						continue
+					}
+					if (pm["type"] == "reasoning" || pm["type"] == "thinking") && len(ids) < 8 {
+						if id, _ := pm["id"].(string); id != "" {
+							ids = append(ids, "nested:"+id)
+						} else {
+							ids = append(ids, "nested:(no-id)")
+						}
+					}
+				}
+			}
+		}
+	}
+	rec := map[string]any{
+		"ts": time.Now().Format(time.RFC3339), "req": reqID,
+		"entry": string(entry), "model": model, "fp": fp,
+		"nItems": nItems, "reasoningIDs": ids, "healed": healed,
+	}
+	b, _ := json.Marshal(rec)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Printf("[REQ %s] forensics write: %v", reqID, err)
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(append(b, '\n'))
+}
+
 // forwardResponses 通用入口：entry 格式由 path 定，上游格式由模型表定。
 // responses 直连注桩；chat 双向转换；messages 直接 400（未探明，不裸奔）。
 func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
@@ -273,25 +372,16 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		}
 	}
 
-	// 入口 -> 上游转换。
-	upReq := in
-	if entry == FmtChat && target == FmtResponses {
-		upReq = chatToResponsesReq(in)
-	} else if entry == FmtResponses && target == FmtChat {
-		upReq = responsesToChatReq(in)
+	buildBody := func() []byte {
+		b, _ := json.Marshal(buildUpstream(entry, target, in))
+		return b
 	}
-	// 注桩（分上游格式）。
-	if target == FmtResponses {
-		mergeStubTools(upReq)
-	} else {
-		mergeChatStubTools(upReq)
-	}
-	upBody, _ := json.Marshal(upReq)
+	upBody := buildBody()
 
-	doUpstream := func(ses string) (*http.Response, error) {
+	doUpstream := func(ses string, body []byte) (*http.Response, error) {
 		u := *upstream
 		u.Path = singleJoin(upstream.Path, target.upstreamPath())
-		fwd, _ := http.NewRequestWithContext(req.Context(), "POST", u.String(), bytes.NewReader(upBody))
+		fwd, _ := http.NewRequestWithContext(req.Context(), "POST", u.String(), bytes.NewReader(body))
 		fwd.Header.Set("Content-Type", "application/json")
 		setZenHeaders(fwd.Header, apiKey, project)
 		if ses != "" {
@@ -307,7 +397,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	// 上游包体空闲超时：首字节后 stall 即掐（防半截流钉死 handler）。
 	// 超时直接 Close 上游体打断阻塞 Read（见 newIdleTimeoutBody）。
 	streamIdle := streamIdleTimeout()
-	resp, err := doUpstream(upSes)
+	resp, err := doUpstream(upSes, upBody)
 	if err != nil {
 		writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
 		return
@@ -317,9 +407,39 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		resp.Body.Close()
 		log.Printf("[REQ %s] pooled session expired, rotate and retry once", reqID)
 		poolSes, _ = poolRotate(fp)
-		resp, err = doUpstream(poolSes)
+		resp, err = doUpstream(poolSes, upBody)
 		if err != nil {
 			writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
+			return
+		}
+	}
+	// caller-mismatch 400 自愈（仅 responses 入口 + 池 lineage + 一次）：
+	// 池命中时首轮 strip 被跳过，历史里混着跨 key 毒串必 400；
+	// 此时轮换 session + 强制剥离重建 body 再发一次。
+	// 写下游字节前判定，流/非流皆安全。
+	if resp.StatusCode == 400 && entry == FmtResponses && usePool {
+		bpeek, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+		if isCallerMismatch(bpeek) {
+			log.Printf("[REQ %s] caller-mismatch, rotate+strip and retry once", reqID)
+			poolSes, _ = poolRotate(fp)
+			stripForeignBlobs(in, true)
+			upBody = buildBody()
+			resp, err = doUpstream(poolSes, upBody)
+			if err != nil {
+				writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
+				return
+			}
+			if resp.StatusCode != 200 {
+				logForensics(reqID, entry, model, fp, in, false)
+				passthruUpstreamError(w, reqID, resp, streamIdle)
+				return
+			}
+			logForensics(reqID, entry, model, fp, in, true)
+		} else {
+			// 非 caller-mismatch 的 400：原样透传已读体。
+			log.Printf("[REQ %s] upstream 400: %.300s", reqID, string(bpeek))
+			writeBodyWithType(w, resp, 400, bpeek)
 			return
 		}
 	}
