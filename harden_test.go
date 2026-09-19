@@ -360,3 +360,41 @@ func TestUpstreamErrorPassthrough(t *testing.T) {
 		t.Fatalf("错误体应透传：%q", rec.Body.String())
 	}
 }
+
+func TestCollectReasoningIDs(t *testing.T) {
+	in := map[string]any{"input": []any{
+		map[string]any{"type": "reasoning", "id": "rs_top1"},
+		map[string]any{"type": "reasoning"},
+		map[string]any{"type": "message", "content": []any{
+			map[string]any{"type": "reasoning", "id": "rs_nest1"},
+			map[string]any{"type": "thinking"},
+			map[string]any{"type": "output_text", "text": "hi"},
+		}},
+		map[string]any{"type": "message", "content": []any{
+			map[string]any{"type": "output_text", "text": "x"},
+		}},
+		map[string]any{"type": "function_call", "id": "fc_1"},
+	}}
+	got := collectReasoningIDs(in)
+	want := []string{"rs_top1", "(no-id)", "nested:rs_nest1", "nested:(no-id)"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v want %v", got, want)
+		}
+	}
+	if got := collectReasoningIDs(map[string]any{}); len(got) != 0 {
+		t.Fatalf("empty in should give no ids, got %v", got)
+	}
+}
+
+func TestShortStr(t *testing.T) {
+	if shortStr("abcdef", 16) != "abcdef" {
+		t.Fatal("short strings must pass through")
+	}
+	if shortStr("abcdef", 3) != "abc" {
+		t.Fatal("long strings must truncate")
+	}
+}

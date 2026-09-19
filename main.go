@@ -217,7 +217,52 @@ func isCallerMismatch(body []byte) bool {
 		strings.Contains(s, "was not issued")
 }
 
-// buildUpstream 入口 -> 上游转换 + 注桩（自愈重试需重建 body，抽出复用）。
+// debugOn DIRECT_DEBUG=1 时转储 reasoning IDs + 上游体前 4KB。
+// 入口行（模型/会话/池/字节数）常驻一行，无需开关——单行成本，定位靠它。
+func debugOn() bool { return os.Getenv("DIRECT_DEBUG") == "1" }
+
+func shortStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+// collectReasoningIDs 入口 input[] 顶层 + message.content[] 内嵌的 reasoning/thinking id。
+func collectReasoningIDs(in map[string]any) []string {
+	ids := []string{}
+	items, _ := in["input"].([]any)
+	for _, raw := range items {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if m["type"] == "reasoning" {
+			if id, _ := m["id"].(string); id != "" {
+				ids = append(ids, id)
+			} else {
+				ids = append(ids, "(no-id)")
+			}
+			continue
+		}
+		if content, ok := m["content"].([]any); ok {
+			for _, p := range content {
+				pm, ok := p.(map[string]any)
+				if !ok {
+					continue
+				}
+				if pm["type"] == "reasoning" || pm["type"] == "thinking" {
+					if id, _ := pm["id"].(string); id != "" {
+						ids = append(ids, "nested:"+id)
+					} else {
+						ids = append(ids, "nested:(no-id)")
+					}
+				}
+			}
+		}
+	}
+	return ids
+}
 func buildUpstream(entry Format, target Format, in map[string]any) map[string]any {
 	upReq := in
 	if entry == FmtChat && target == FmtResponses {
@@ -377,6 +422,17 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		return b
 	}
 	upBody := buildBody()
+	log.Printf("[REQ %s] in=%s model=%s target=%s stream=%v official=%v fp=%s ses=%s new=%v upBytes=%d",
+		reqID, entry, model, target, stream, official, shortStr(fp, 16), shortStr(poolSes, 20), isNewFP, len(upBody))
+	if debugOn() {
+		ids := collectReasoningIDs(in)
+		log.Printf("[REQ %s] debug reasoningIDs=%v", reqID, ids)
+		n := len(upBody)
+		if n > 4096 {
+			n = 4096
+		}
+		log.Printf("[REQ %s] debug upBody[:%d]=%.4000s", reqID, n, string(upBody[:n]))
+	}
 
 	doUpstream := func(ses string, body []byte) (*http.Response, error) {
 		u := *upstream
@@ -435,6 +491,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 				passthruUpstreamError(w, reqID, resp, streamIdle)
 				return
 			}
+			log.Printf("[REQ %s] caller-mismatch healed, retry 200", reqID)
 			logForensics(reqID, entry, model, fp, in, true)
 		} else {
 			// 非 caller-mismatch 的 400：原样透传已读体。
@@ -585,7 +642,7 @@ func main() {
 	mux.HandleFunc("/v1/messages", post(FmtMessages))
 
 	addr := ":" + env("PORT", "8080")
-	log.Printf("zen-direct listening %s upstream %s", addr, upstream.String())
+	log.Printf("zen-direct listening %s upstream %s debug=%v concurrency=%d", addr, upstream.String(), debugOn(), fwdConcurrency())
 	// WriteTimeout 不设：SSE 流可长达数分钟，写超时会掐正常流。
 	// 空闲超时 + 读头超时防慢连接占 handler。
 	srv := &http.Server{
