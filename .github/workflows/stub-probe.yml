@@ -16,7 +16,7 @@ jobs:
           cat > forward_rec.py <<'EOF'
           from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
           import json, shutil, urllib.request
-          UP = "https://opencode.ai/zen/v1"
+          UP = "https://opencode.ai/zen"
           class H(BaseHTTPRequestHandler):
               def _fwd(self):
                   n = int(self.headers.get('Content-Length', 0))
