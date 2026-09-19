@@ -28,17 +28,37 @@ func stripForeignBlobs(in map[string]any, isNewFP bool) {
 			continue
 		}
 		blob, _ := m["encrypted_content"].(string)
-		if blob == "" {
+		id, _ := m["id"].(string)
+		// 外来纯 id（无 blob）同样不可信：上游必报 not found/expired。
+		// 有可读文本则去 id 留文本，无文本整条丢。
+		if blob == "" && id != "" {
+			delete(m, "id")
+		}
+		if blob == "" && id == "" {
 			kept = append(kept, raw)
 			continue
 		}
-		sum, _ := m["summary"].([]any)
+		// summary 形态：数组元素 .text；字符串/对象直接取文本。
+		// 任一形态有文本即保留，无文本整条丢弃。
 		texts := 0
-		for _, s := range sum {
-			if sm, ok := s.(map[string]any); ok {
-				if t, ok := sm["text"].(string); ok && strings.TrimSpace(t) != "" {
+		switch sum := m["summary"].(type) {
+		case []any:
+			for _, s := range sum {
+				if sm, ok := s.(map[string]any); ok {
+					if t, ok := sm["text"].(string); ok && strings.TrimSpace(t) != "" {
+						texts++
+					}
+				} else if t, ok := s.(string); ok && strings.TrimSpace(t) != "" {
 					texts++
 				}
+			}
+		case string:
+			if strings.TrimSpace(sum) != "" {
+				texts++
+			}
+		case map[string]any:
+			if t, ok := sum["text"].(string); ok && strings.TrimSpace(t) != "" {
+				texts++
 			}
 		}
 		if texts == 0 {

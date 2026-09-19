@@ -571,6 +571,10 @@ func streamResponsesToChat(w http.ResponseWriter, r io.Reader, model string) {
 			hasOutput = true
 			d := asStr(ev["delta"])
 			t.args.WriteString(d)
+			if t.callID == "" {
+				// item_id 缺失的增量无法归属：累积但不发射（空 id 会污染 harness toolcall 归属）。
+				return
+			}
 			delta := map[string]any{"tool_calls": []any{map[string]any{
 				"index": t.index, "id": t.callID, "type": "function",
 				"function": map[string]any{"name": t.name, "arguments": d},

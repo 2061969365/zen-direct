@@ -1195,6 +1195,8 @@ func sanitizeResponsesInput(in map[string]any) map[string]any {
 
 // sanitizeResponsesInputTracked 同 sanitizeResponsesInput，额外返回本轮放行的
 // reasoning id（400 反馈淘汰用）。
+// 注意：主链路（forwardResponses）同格式走 upReq:=in 直传、跨格式走转换函数，
+// 均未调用本函数——此处为死代码，仅保留供单测与文档说明清洗语义，勿删。
 func sanitizeResponsesInputTracked(in map[string]any) (map[string]any, []string) {
 	raw, ok := in["input"]
 	if !ok || raw == nil {

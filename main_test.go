@@ -5,15 +5,34 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 )
 
-var lastUpPath, lastUpBody string
+// 上游抓包全局量：mock handler（独立 goroutine）与断言 goroutine 并发读写，
+// 必须加锁，否则 go test -race 必报（生产无此路径）。
+var (
+	lastUpMu   sync.Mutex
+	lastUpPath string
+	lastUpBody string
+	lastUpSess string
+)
+
+func setLastUp(path, body, sess string) {
+	lastUpMu.Lock()
+	defer lastUpMu.Unlock()
+	lastUpPath, lastUpBody, lastUpSess = path, body, sess
+}
+
+func getLastUp() (path, body, sess string) {
+	lastUpMu.Lock()
+	defer lastUpMu.Unlock()
+	return lastUpPath, lastUpBody, lastUpSess
+}
 
 func withMockUpstream(t *testing.T, sse string) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		lastUpPath = req.URL.Path
 		b := make([]byte, 0, 4096)
 		buf := make([]byte, 1024)
 		for {
@@ -23,7 +42,7 @@ func withMockUpstream(t *testing.T, sse string) {
 				break
 			}
 		}
-		lastUpBody = string(b)
+		setLastUp(req.URL.Path, string(b), req.Header.Get("X-Opencode-Session"))
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(sse))
 	}))
@@ -97,11 +116,12 @@ func TestChatEntryRoutesChat(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("http=%d", code)
 	}
-	if lastUpPath != "/chat/completions" {
-		t.Fatalf("上游路径错误：%s", lastUpPath)
+	upPath, upBody, _ := getLastUp()
+	if upPath != "/chat/completions" {
+		t.Fatalf("上游路径错误：%s", upPath)
 	}
-	if !strings.Contains(lastUpBody, `"messages"`) {
-		t.Fatalf("上游体应为 chat 形：%.200s", lastUpBody)
+	if !strings.Contains(upBody, `"messages"`) {
+		t.Fatalf("上游体应为 chat 形：%.200s", upBody)
 	}
 }
 
