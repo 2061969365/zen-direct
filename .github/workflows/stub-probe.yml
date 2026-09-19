@@ -73,7 +73,8 @@ jobs:
           print("MODEL:", b.get('model'), "| STREAM:", b.get('stream'), "| STORE:", b.get('store'))
           print("REASONING:", json.dumps(b.get('reasoning')))
           EOF
-      # replay the clean tool list against the REAL gate
+      # replay matrix against the REAL gate:
+      # R1 clean-10 bare | R2 clean-10 + prompt_cache_key/store/tool_choice/max_tokens (official extras)
       - run: |
           python3 - <<'EOF'
           import json, secrets, urllib.request
@@ -85,24 +86,30 @@ jobs:
               for t in tools:
                   n = t.get('function', {}).get('name', t.get('name'))
                   if n: names.append(n)
-          print("REPLAYING", len(names), "clean-machine tool names")
-          ses = 'ses_' + ''.join(secrets.choice('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(24))
-          body = {"model": "muse-spark-1.3-contributor-free", "stream": True,
-                  "input": [{"role": "user", "content": [{"type": "input_text", "text": "Reply with exactly: PONG"}]}]}
-          if names:
-              body["tools"] = [{"type": "function", "name": n, "description": "probe",
-                                "parameters": {"type": "object", "properties": {}}} for n in names]
-          req = urllib.request.Request("https://opencode.ai/zen/v1/responses",
-              data=json.dumps(body).encode(), method="POST", headers={
-              "Authorization": "Bearer public", "Content-Type": "application/json",
-              "User-Agent": "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
-              "X-Opencode-Session": ses, "X-Opencode-Client": "opencode",
-              "X-Opencode-Project": "default", "X-Opencode-Request": "msg_probe1"})
-          try:
-              with urllib.request.urlopen(req, timeout=90) as r:
-                  print("GATE_STATUS:", r.status, "(clean tool list PASSES)" if r.status == 200 else "")
-                  r.read(200)
-          except Exception as e:
-              print("GATE_STATUS: FAIL", str(e)[:200])
+          print("clean-machine tool names:", len(names), sorted(names))
+          print("official prompt_cache_key present:", 'prompt_cache_key' in b,
+                "| tool_choice:", b.get('tool_choice'), "| max_output_tokens:", b.get('max_output_tokens'))
+          def post(label, body):
+              ses = 'ses_' + ''.join(secrets.choice('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(24))
+              req = urllib.request.Request("https://opencode.ai/zen/v1/responses",
+                  data=json.dumps(body).encode(), method="POST", headers={
+                  "Authorization": "Bearer public", "Content-Type": "application/json",
+                  "User-Agent": "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
+                  "X-Opencode-Session": ses, "X-Opencode-Client": "opencode",
+                  "X-Opencode-Project": "default", "X-Opencode-Request": "msg_" + secrets.token_hex(6)})
+              try:
+                  with urllib.request.urlopen(req, timeout=90) as r:
+                      print(label, "GATE_STATUS:", r.status); r.read(200)
+              except Exception as e:
+                  print(label, "GATE_STATUS: FAIL", str(e)[:160])
+          stub = lambda n: {"type": "function", "name": n, "description": "probe",
+                            "parameters": {"type": "object", "properties": {}}}
+          base_input = [{"role": "user", "content": [{"type": "input_text", "text": "Reply with exactly: PONG"}]}]
+          post("R1_clean10_bare", {"model": "muse-spark-1.3-contributor-free", "stream": True,
+              "input": base_input, "tools": [stub(n) for n in names]})
+          post("R2_clean10_official_extras", {"model": "muse-spark-1.3-contributor-free", "stream": True,
+              "store": False, "prompt_cache_key": "ses_" + ''.join(secrets.choice('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(24)),
+              "tool_choice": b.get('tool_choice', 'auto'), "max_output_tokens": b.get('max_output_tokens', 32000),
+              "input": base_input, "tools": [stub(n) for n in names]})
           EOF
       - run: kill $(cat mock.pid) || true
