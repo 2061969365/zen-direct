@@ -1,54 +1,13 @@
 // stubs.go: opencode tool-name allowlist (descriptions intentionally stubbed).
-// zen FreeTier gate requires these names present on stream+tools requests.
+// zen FreeTier gate requires 'read' + companions on stream+tools requests
+// (probe4 2026-09-20: 13 non-cad names = 200; cad 44 unrelated to gate).
+// 57 -> 13 slim (v0.2.9): drop 44 cad-mcp_* (upstream echoes tools in every
+// response.completed; 8KB saved per round-trip both directions).
 // Generated from a captured opencode request; regenerate if the gate changes.
 package main
 
 var stubToolNames = []string{
 	"bash",
-	"cad-mcp_add_dimension",
-	"cad-mcp_audit_drawing",
-	"cad-mcp_check_advisory",
-	"cad-mcp_check_deliverables",
-	"cad-mcp_check_opening",
-	"cad-mcp_check_residential",
-	"cad-mcp_copy_by_tag",
-	"cad-mcp_dim_chain",
-	"cad-mcp_draw_arc",
-	"cad-mcp_draw_axis_grid",
-	"cad-mcp_draw_circle",
-	"cad-mcp_draw_compass",
-	"cad-mcp_draw_door",
-	"cad-mcp_draw_door_set",
-	"cad-mcp_draw_ellipse",
-	"cad-mcp_draw_furniture",
-	"cad-mcp_draw_hatch",
-	"cad-mcp_draw_leader",
-	"cad-mcp_draw_level",
-	"cad-mcp_draw_line",
-	"cad-mcp_draw_lwpolyline",
-	"cad-mcp_draw_mtext",
-	"cad-mcp_draw_polyline",
-	"cad-mcp_draw_rectangle",
-	"cad-mcp_draw_schedule_table",
-	"cad-mcp_draw_stair",
-	"cad-mcp_draw_text",
-	"cad-mcp_draw_toilet",
-	"cad-mcp_draw_wall_run",
-	"cad-mcp_draw_window",
-	"cad-mcp_erase_by_filter",
-	"cad-mcp_export_preview",
-	"cad-mcp_insert_block",
-	"cad-mcp_mirror_by_tag",
-	"cad-mcp_move_by_tag",
-	"cad-mcp_open_drawing",
-	"cad-mcp_process_command",
-	"cad-mcp_query_entities",
-	"cad-mcp_redraw_component",
-	"cad-mcp_rotate_by_tag",
-	"cad-mcp_save_drawing",
-	"cad-mcp_scale_by_tag",
-	"cad-mcp_setup_dim_style",
-	"cad-mcp_setup_layers",
 	"edit",
 	"glob",
 	"grep",

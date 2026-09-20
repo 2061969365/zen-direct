@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -383,6 +384,38 @@ func logForensics(reqID string, entry Format, model, fp string, in map[string]an
 // retry502Backoff 502/503 重试退避（包级变量，单测可覆盖成毫秒级）。
 var retry502Backoff = 1500 * time.Millisecond
 
+// max429Wait Retry-After 上限：超了也不值得占槽等，按上限等一次。
+var max429Wait = 30 * time.Second
+
+// parseRetryAfter 解析 Retry-After（秒数或 HTTP-date）：缺失/非法回退
+// retry502Backoff，解析值按 max429Wait 封顶。
+func parseRetryAfter(v string) time.Duration {
+	if v == "" {
+		return retry502Backoff
+	}
+	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+		if secs < 0 {
+			secs = 0
+		}
+		d := time.Duration(secs) * time.Second
+		if d > max429Wait {
+			d = max429Wait
+		}
+		return d
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		d := time.Until(t)
+		if d < 0 {
+			d = 0
+		}
+		if d > max429Wait {
+			d = max429Wait
+		}
+		return d
+	}
+	return retry502Backoff
+}
+
 func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	reqID := "resp_dir_" + randHex(6)
 	reqStart := time.Now()
@@ -583,15 +616,23 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 			return
 		}
 	}
-	// 上游 502/503 瞬时抖：退避重发一次（写下游字节前，流/非流皆安全）。
-	// 500 不碰（模型真失败，重试纯烧钱）；429 不碰（限流越冲越死）。
-	// 注意：自愈分支的 400 重试若撞上 502/503，会落到这里再重试一次（最多 3 次上游调用）。
-	if resp.StatusCode == 502 || resp.StatusCode == 503 {
-		log.Printf("[REQ %s] upstream %d flaky, backoff retry once", reqID, resp.StatusCode)
-		statsAddFlakyRetry()
+	// 上游 502/503 瞬时抖：退避重发一次；429 限流：按 Retry-After 等一次。
+	// 500 不碰（模型真失败，重试纯烧钱）。
+	// 注意：自愈分支的 400 重试若撞上 502/503/429，会落到这里再重试一次
+	//（最多 3 次上游调用）。
+	if resp.StatusCode == 502 || resp.StatusCode == 503 || resp.StatusCode == 429 {
+		wait := retry502Backoff
+		if resp.StatusCode == 429 {
+			wait = parseRetryAfter(resp.Header.Get("Retry-After"))
+			statsAddRateRetry()
+			log.Printf("[REQ %s] upstream 429 rate-limited, wait %v retry once", reqID, wait)
+		} else {
+			log.Printf("[REQ %s] upstream %d flaky, backoff retry once", reqID, resp.StatusCode)
+			statsAddFlakyRetry()
+		}
 		resp.Body.Close()
 		select {
-		case <-time.After(retry502Backoff):
+		case <-time.After(wait):
 		case <-req.Context().Done():
 			writeErr(w, 499, "client_closed", "client closed during retry backoff")
 			return
@@ -868,8 +909,8 @@ func main() {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		s := statsSnapshot()
-		fmt.Fprintf(w, `{"status":"ok","mode":"direct","stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d}}`,
-			s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
+		fmt.Fprintf(w, `{"status":"ok","mode":"direct","stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"rate_retry":%d,"up5xx":%d,"up4xx":%d,"circuit_open":%d,"pool_hit":%d,"pool_miss":%d,"pool_evict":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d}}`,
+			s.Reqs, s.TransportRetry, s.FlakyRetry, s.RateRetry, s.Up5xx, s.Up4xx, s.CircuitOpens, s.PoolHit, s.PoolMiss, s.PoolEvict, s.TTFBP50, s.TTFBP95)
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != "GET" {

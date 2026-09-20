@@ -34,7 +34,7 @@ func TestMergeStubTools(t *testing.T) {
 			t.Fatalf("重复：%s x%d", n, c)
 		}
 	}
-	// 客户端的 bash 定义必须原样保留（不能被桩覆盖），57 名必须齐。
+	// 客户端的 bash 定义必须原样保留（不能被桩覆盖），桩名必须齐。
 	for _, raw := range items {
 		m, _ := raw.(map[string]any)
 		if m["name"] == "bash" && m["description"] != "client tool" {
@@ -51,6 +51,25 @@ func TestMergeStubTools(t *testing.T) {
 	mergeStubTools(empty)
 	if items, _ := empty["tools"].([]any); len(items) != len(stubToolNames) {
 		t.Fatalf("空输入应全量补桩，得 %d", len(items))
+	}
+}
+
+// v0.2.9 slim: 13 non-cad names (probe4 2026-09-20 C6=200); must contain read.
+func TestStubSetSlim13(t *testing.T) {
+	if len(stubToolNames) != 13 {
+		t.Fatalf("桩应精简为13，得 %d", len(stubToolNames))
+	}
+	hasRead := false
+	for _, n := range stubToolNames {
+		if n == "read" {
+			hasRead = true
+		}
+		if len(n) >= 8 && n[:8] == "cad-mcp_" {
+			t.Fatalf("cad 桩应已删除：%s", n)
+		}
+	}
+	if !hasRead {
+		t.Fatal("桩必须含 read（门禁必要条件）")
 	}
 }
 

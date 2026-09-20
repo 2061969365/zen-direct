@@ -93,6 +93,7 @@ func poolBorrow(fp string) string {
 // poolBorrowEx 同 poolBorrow，多返回 isNew（首见=true，给剥 blob 用）。
 func poolBorrowEx(fp string) (string, bool) {
 	if s := poolLookup(fp); s != "" {
+		statsAddPoolHit()
 		return s, false
 	}
 	ses := mintID("ses")
@@ -111,6 +112,7 @@ func poolBorrowEx(fp string) (string, bool) {
 	poolDirty = true
 	poolMu.Unlock()
 	poolSaveAsync()
+	statsAddPoolMiss()
 	return ses, true
 }
 
@@ -130,6 +132,7 @@ func poolEvict(fp string) {
 	poolDirty = true
 	poolMu.Unlock()
 	poolSaveAsync()
+	statsAddPoolEvict()
 }
 
 // poolRotate 原子轮换：驱逐旧 session 并签发新 session 在同一临界区内完成。
@@ -157,6 +160,7 @@ func poolRotate(fp string) (string, bool) {
 	poolDirty = true
 	poolMu.Unlock()
 	poolSaveAsync()
+	statsAddPoolEvict()
 	return ses, true
 }
 

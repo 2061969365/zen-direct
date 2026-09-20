@@ -479,7 +479,7 @@ func TestBadIDCap(t *testing.T) {
 }
 
 func TestPipeSSEFarTerminal(t *testing.T) {
-	// 终态标记距 EOF 超 4KB（completed 回显 57 桩 tools 的 8KB+ 单行）：
+	// 终态标记距 EOF 超 4KB（completed 回显 tools 的大单行）：
 	// 粘性标记不得因窗口挤出而误报 failed。
 	pad := strings.Repeat("x", 9000)
 	body := "data: {\"type\":\"response.completed\"}\n\ndata: {\"pad\":\"" + pad + "\"}\n\n"
@@ -745,6 +745,81 @@ func TestNoRetryOn500(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("500不得重试，上游应恰1次: %d", calls.Load())
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	oldBO := retry502Backoff
+	retry502Backoff = 1500 * time.Millisecond
+	defer func() { retry502Backoff = oldBO }()
+
+	if d := parseRetryAfter(""); d != 1500*time.Millisecond {
+		t.Fatalf("缺省应回退1.5s: %v", d)
+	}
+	if d := parseRetryAfter("3"); d != 3*time.Second {
+		t.Fatalf("秒数解析错: %v", d)
+	}
+	if d := parseRetryAfter("9999"); d != 30*time.Second {
+		t.Fatalf("应封顶30s: %v", d)
+	}
+	if d := parseRetryAfter("not-a-date"); d != 1500*time.Millisecond {
+		t.Fatalf("非法应回退: %v", d)
+	}
+	future := time.Now().Add(5 * time.Second).UTC().Format(http.TimeFormat)
+	if d := parseRetryAfter(future); d < 3*time.Second || d > 6*time.Second {
+		t.Fatalf("HTTP-date解析错: %v", d)
+	}
+}
+
+func TestRetry429Once(t *testing.T) {
+	defer cbReset()
+	statsReset()
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(429)
+			_, _ = w.Write([]byte(`{"error":"slow down"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"r3","status":"completed","output":[],"usage":{"total_tokens":1}}`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	old := upstream
+	upstream = u
+	defer func() { upstream = old }()
+	code, _ := postResponses(t, "http://x", `{"model":"m","stream":false,"input":"hi"}`)
+	if code != 200 {
+		t.Fatalf("429重试后应200: %d", code)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("应恰好上游2次: %d", calls.Load())
+	}
+	if s := statsSnapshot(); s.RateRetry != 1 {
+		t.Fatalf("rate_retry应=1: %+v", s)
+	}
+}
+
+func TestStatsPoolCounters(t *testing.T) {
+	statsReset()
+	fp := "fp-stat-" + randHex(4)
+	ses1, isNew := poolBorrowEx(fp)
+	if !isNew {
+		t.Fatal("首借应isNew")
+	}
+	if ses2, isNew := poolBorrowEx(fp); isNew || ses2 != ses1 {
+		t.Fatal("次借应命中同session")
+	}
+	poolEvict(fp)
+	s := statsSnapshot()
+	if s.PoolMiss != 1 || s.PoolHit != 1 || s.PoolEvict != 1 {
+		t.Fatalf("pool计数错位: %+v", s)
+	}
+	statsReset()
+	if s := statsSnapshot(); s.PoolHit != 0 || s.PoolMiss != 0 || s.PoolEvict != 0 || s.RateRetry != 0 {
+		t.Fatal("reset 应清零pool/rate计数")
 	}
 }
 

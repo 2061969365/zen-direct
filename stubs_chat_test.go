@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-// chat 桩：同 57 名，chat functions 形。mimo 已验 9 核，全套更稳。
+// chat 桩：同桩表名，chat functions 形。
 func TestMergeChatStubTools(t *testing.T) {
 	mk := func(name string) map[string]any {
 		return map[string]any{
