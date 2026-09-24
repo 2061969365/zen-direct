@@ -1,6 +1,7 @@
 // zen-direct: FreeTier 直连网关 v1。
 // 配方（实测）: stream:true + tools 含 opencode 57 桩名 + 官方 UA + 合法 ses/req
 // 即可 200，无需 opencode 子进程。harness 原生 tool loop 直通。
+// 上游恒强制 stream:true；客户端非流由网关聚 SSE（nonstream.go）。
 package main
 
 import (
@@ -467,7 +468,11 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	}
 
 	buildBody := func() []byte {
-		b, _ := json.Marshal(buildUpstream(entry, target, in))
+		u := buildUpstream(entry, target, in)
+		// FreeTier 门禁实测要求上游 stream:true（否则 403）；
+		// 客户端非流由网关聚 SSE 回 JSON（见 nonstream.go）。
+		u["stream"] = true
+		b, _ := json.Marshal(u)
 		return b
 	}
 	upBody := buildBody()
@@ -638,9 +643,22 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		pipeSSE(w, ir, reqID, model, ttfbMs)
 		return
 	}
+	// 上游恒为 SSE（buildBody 强制 stream:true）；客户端非流时聚合回 JSON。
+	raw, errRd := io.ReadAll(io.LimitReader(ir, 64<<20))
+	if errRd != nil {
+		writeErr(w, 502, "upstream_error", "read upstream response: "+errRd.Error())
+		return
+	}
 	var upResp map[string]any
-	if err := json.NewDecoder(io.LimitReader(ir, 64<<20)).Decode(&upResp); err != nil {
-		writeErr(w, 502, "upstream_error", "decode upstream response: "+err.Error())
+	if looksLikeSSE(raw) {
+		upResp, err = assembleNonStreamFromSSE(raw, target, model)
+		if err != nil {
+			log.Printf("[REQ %s] non-stream assemble: %v", reqID, err)
+			writeErr(w, 502, "upstream_error", err.Error())
+			return
+		}
+	} else if errJ := json.Unmarshal(raw, &upResp); errJ != nil {
+		writeErr(w, 502, "upstream_error", "decode upstream response: "+errJ.Error())
 		return
 	}
 	// 非流 completed 同样回显 tools：harness 自带定义，删之（有 output 才认定是响应体形状）。
