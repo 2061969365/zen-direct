@@ -172,4 +172,5 @@ jobs:
       - run: go build -trimpath -ldflags '-s -w' -o ${{ matrix.out }} .
         env:
           CGO_ENABLED: '0'
-      # 注：release 双二进制走本地交叉编译上传；Actions artifact 配额已满，不再上传。
+      # 注：正式 Release 二进制走本地交叉编译 + `gh release create` 发附件；
+      # Actions artifact 配额已满，不再经 artifact 中转。
