@@ -159,6 +159,9 @@ try {
 }
 
 # --- 6) start/stop smoke on free port ---
+# NOTE: do NOT use Start-Process -Hidden here. On this machine Defender holds
+# hidden process creation of zen-direct.exe for ~2 min per launch (observed
+# 15:33-15:45), while `cmd start /min` returns immediately. Bat uses cmd path.
 Write-Host "=== start smoke ==="
 $port = 18099
 $busy = $null
@@ -174,7 +177,7 @@ if ($busy) {
   $oldBase = $env:OPENCODE_ZEN_BASE
   $oldPool = $env:SHIM_SESSION_FILE
   $oldLog = $env:LOG_FILE
-  $p = $null
+  $smokePid = $null
   try {
     $env:PORT = "$port"
     $env:DIRECT_DIAG = '0'
@@ -182,25 +185,34 @@ if ($busy) {
     $env:OPENCODE_ZEN_BASE = 'http://127.0.0.1:1'
     $env:SHIM_SESSION_FILE = Join-Path $env:TEMP 'verify-pool.json'
     $env:LOG_FILE = Join-Path $env:TEMP 'verify-zen.log'
-    $p = Start-Process -FilePath $Exe -WindowStyle Hidden -PassThru
-    Start-Sleep -Seconds 2
+    cmd /c "start `"verify-zen`" /min `"$Exe`""
+    # discover pid by listening port (up to ~10s)
+    for ($i = 0; $i -lt 20 -and -not $smokePid; $i++) {
+      Start-Sleep -Milliseconds 500
+      $c = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty OwningProcess
+      if ($c) { $smokePid = $c }
+    }
     $h = $null
-    try {
-      $h = & curl.exe -s -m 3 "http://127.0.0.1:$port/health" 2>$null
-      if (-not $h) {
-        $h = (Invoke-WebRequest -Uri "http://127.0.0.1:$port/health" -TimeoutSec 3 -UseBasicParsing).Content
+    if ($smokePid) {
+      Start-Sleep -Seconds 1
+      try {
+        $h = & curl.exe -s -m 3 "http://127.0.0.1:$port/health" 2>$null
+        if (-not $h) {
+          $h = (Invoke-WebRequest -Uri "http://127.0.0.1:$port/health" -TimeoutSec 3 -UseBasicParsing).Content
+        }
+      } catch {
+        $h = $null
       }
-    } catch {
-      $h = $null
     }
     if ("$h" -match '"status"\s*:\s*"ok"') {
-      Ok "start smoke /health ok"
+      Ok "start smoke /health ok (pid $smokePid)"
     } else {
       Bad "start smoke health bad: $h"
     }
   } finally {
-    if ($p -and -not $p.HasExited) {
-      try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch { }
+    if ($smokePid) {
+      try { Stop-Process -Id $smokePid -Force -ErrorAction SilentlyContinue } catch { }
     }
     $env:PORT = $oldPort
     $env:DIRECT_DIAG = $oldDiag

@@ -986,8 +986,8 @@ func main() {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		s := statsSnapshot()
-		fmt.Fprintf(w, `{"status":"ok","mode":"direct","stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d}}`,
-			s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
+		fmt.Fprintf(w, `{"status":"ok","mode":"direct","version":%q,"stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d}}`,
+			appVersion, s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != "GET" {
@@ -1017,7 +1017,7 @@ func main() {
 	mux.HandleFunc("/v1/messages", post(FmtMessages))
 
 	addr := ":" + env("PORT", "8080")
-	log.Printf("zen-direct listening %s upstream %s debug=%v concurrency=%d", addr, upstream.String(), debugOn(), fwdConcurrency())
+	log.Printf("zen-direct %s listening %s upstream %s debug=%v concurrency=%d", appVersion, addr, upstream.String(), debugOn(), fwdConcurrency())
 	// WriteTimeout 不设：SSE 流可长达数分钟，写超时会掐正常流。
 	// 空闲超时 + 读头超时防慢连接占 handler。
 	srv := &http.Server{
