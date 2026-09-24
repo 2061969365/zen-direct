@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -180,6 +182,96 @@ func forwardModels(w http.ResponseWriter, req *http.Request) {
 	_, _ = io.Copy(w, io.LimitReader(resp.Body, 4<<20))
 }
 
+// ipProviders 出口 IP 探测源（var 供单测替换）。
+var ipProviders = []string{"https://api.ipquery.io", "http://ip-api.com/json"}
+
+var ipv4Re = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}\b`)
+
+func validIPv4(s string) bool {
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if p == "" || len(p) > 3 {
+			return false
+		}
+		n := 0
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return false
+			}
+			n = n*10 + int(c-'0')
+		}
+		if n > 255 {
+			return false
+		}
+	}
+	return true
+}
+
+// fetchIPFrom 单源探测：10s 超时，正文抽第一个合法 IPv4。
+func fetchIPFrom(ctx context.Context, src string) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, "GET", src, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := ipHTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("http %d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return "", err
+	}
+	m := ipv4Re.FindString(string(b))
+	if m == "" || !validIPv4(m) {
+		return "", fmt.Errorf("no ipv4 in body")
+	}
+	return m, nil
+}
+
+// ipHTTPClient /ip 探测专用客户端（不走 zen httpClient 的代理超时语义）。
+var ipHTTPClient = &http.Client{Timeout: 12 * time.Second}
+
+// handleIP 并行问多源，先到先得（oc2api 同款 /ip，查网关出口 IP）。
+func handleIP(w http.ResponseWriter, req *http.Request) {
+	type result struct {
+		ip, source string
+		err        error
+	}
+	ch := make(chan result, len(ipProviders))
+	ctx := req.Context()
+	for _, src := range ipProviders {
+		src := src
+		go func() {
+			ip, err := fetchIPFrom(ctx, src)
+			ch <- result{ip: ip, source: src, err: err}
+		}()
+	}
+	for i := 0; i < len(ipProviders); i++ {
+		select {
+		case <-ctx.Done():
+			writeErr(w, 504, "timeout_error", "ip lookup timeout")
+			return
+		case r := <-ch:
+			if r.err != nil {
+				continue
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"ip": r.ip, "source": r.source})
+			return
+		}
+	}
+	writeErr(w, 502, "upstream_error", "all IP providers failed")
+}
+
 func singleJoin(base, p string) string {
 	return strings.TrimSuffix(base, "/") + "/" + strings.TrimPrefix(p, "/")
 }
@@ -291,10 +383,18 @@ func buildUpstream(entry Format, target Format, in map[string]any) map[string]an
 	} else if entry == FmtResponses && target == FmtChat {
 		upReq = responsesToChatReq(in)
 	}
+	// 注桩前记录：客户端是否自带真工具（无真工具时硬禁桩被选中，见下）。
+	hadUserTools := len(asArr(in["tools"])) > 0
 	if target == FmtResponses {
 		mergeStubTools(upReq)
 	} else {
 		mergeChatStubTools(upReq)
+	}
+	// 无用户工具时 tool_choice=none（抄 oc2api）：桩只为过 FreeTier 门禁，
+	// never-call 描述挡不住强指令模型；硬禁选择比事后文档可靠。
+	// 客户端自带真工具时不碰其 tool_choice。
+	if !hadUserTools {
+		upReq["tool_choice"] = "none"
 	}
 	return upReq
 }
@@ -895,6 +995,13 @@ func main() {
 			return
 		}
 		forwardModels(w, req)
+	})
+	mux.HandleFunc("/ip", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != "GET" {
+			writeErr(w, 404, "invalid_request_error", "not found")
+			return
+		}
+		handleIP(w, req)
 	})
 	post := func(entry Format) func(http.ResponseWriter, *http.Request) {
 		return func(w http.ResponseWriter, req *http.Request) {
