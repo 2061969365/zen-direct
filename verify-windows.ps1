@@ -2,7 +2,7 @@
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\verify-windows.ps1
 #   ... -Unblock   # remove Mark of the Web
-#   ... -SelfSign  # self-sign with CN=zen-direct-local (CurrentUser\CodeSigning)
+#   ... -SelfSign  # self-sign with CN=zen-direct-local
 param(
   [string]$Exe = (Join-Path $PSScriptRoot 'zen-direct.exe'),
   [switch]$SelfSign,
@@ -42,35 +42,12 @@ if ($streams -contains 'Zone.Identifier') {
 # --- 2) Authenticode ---
 $sig = Get-AuthenticodeSignature -LiteralPath $Exe
 Write-Host "Authenticode status: $($sig.Status)"
+$doSign = $false
 if ($sig.Status -eq 'Valid') {
   Ok "signature Valid: $($sig.SignerCertificate.Subject)"
 } elseif ($sig.Status -eq 'NotSigned') {
   if ($SelfSign) {
-    Warn "NotSigned - applying self-sign..."
-    $cert = $null
-    try {
-      $cert = Get-ChildItem Cert:\CurrentUser\CodeSigning -ErrorAction Stop |
-        Where-Object { $_.Subject -eq 'CN=zen-direct-local' -and $_.NotAfter -gt (Get-Date) } |
-        Sort-Object NotAfter -Descending | Select-Object -First 1
-    } catch { }
-    if (-not $cert) {
-      $cert = New-SelfSignedCertificate -Subject 'CN=zen-direct-local' `
-        -Type CodeSigningCert -CertStoreLocation 'Cert:\CurrentUser\CodeSigning' `
-        -NotAfter (Get-Date).AddYears(2)
-    }
-    $r = $null
-    try {
-      $r = Set-AuthenticodeSignature -FilePath $Exe -Certificate $cert `
-        -TimestampServer 'http://timestamp.digicert.com' -ErrorAction Stop
-    } catch {
-      $r = Set-AuthenticodeSignature -FilePath $Exe -Certificate $cert
-    }
-    if ($r -and ($r.Status -eq 'Valid' -or $r.Status -eq 'UnknownError')) {
-      Ok "self-signed applied (status=$($r.Status))"
-      Warn "SmartScreen may still warn until cert is trusted or OV/EV public cert is used"
-    } else {
-      Bad "self-sign failed: $(if ($r) { $r.Status } else { 'null' })"
-    }
+    $doSign = $true
   } else {
     Warn "NotSigned - SmartScreen/AV may say unknown risk. Use -SelfSign or OV/EV cert."
   }
@@ -78,6 +55,68 @@ if ($sig.Status -eq 'Valid') {
   Bad "HashMismatch - corrupted or tampered"
 } else {
   Warn "signature status: $($sig.Status)"
+}
+
+if ($doSign) {
+  Warn "NotSigned - applying self-sign + trust..."
+  # Prefer CurrentUser\My (always present). CodeSigning substore may be missing.
+  $cert = $null
+  try {
+    $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction Stop |
+      Where-Object { $_.Subject -eq 'CN=zen-direct-local' -and $_.NotAfter -gt (Get-Date).AddDays(30) } |
+      Sort-Object NotAfter -Descending | Select-Object -First 1
+  } catch { }
+  if (-not $cert) {
+    try {
+      $cert = New-SelfSignedCertificate -Subject 'CN=zen-direct-local' `
+        -Type CodeSigningCert -CertStoreLocation 'Cert:\CurrentUser\My' `
+        -NotAfter (Get-Date).AddYears(2) -KeyExportPolicy Exportable `
+        -HashAlgorithm SHA256 -ErrorAction Stop
+    } catch {
+      Bad "cannot create cert: $($_.Exception.Message)"
+    }
+  }
+  if ($cert) {
+    $r = $null
+    try {
+      $r = Set-AuthenticodeSignature -FilePath $Exe -Certificate $cert `
+        -TimestampServer 'http://timestamp.digicert.com' -ErrorAction Stop
+    } catch {
+      try { $r = Set-AuthenticodeSignature -FilePath $Exe -Certificate $cert -ErrorAction Stop }
+      catch { Bad "Set-AuthenticodeSignature failed: $($_.Exception.Message)" }
+    }
+    # Trust chain: export + import Root + TrustedPublisher so Status becomes Valid.
+    if ($cert) {
+      $cerPath = Join-Path $env:TEMP 'zen-direct-local.cer'
+      try {
+        Export-Certificate -Cert $cert -FilePath $cerPath -Force | Out-Null
+        foreach ($store in @('Root', 'TrustedPublisher')) {
+          $target = "Cert:\CurrentUser\$store"
+          $have = Get-ChildItem $target -ErrorAction SilentlyContinue |
+            Where-Object { $_.Thumbprint -eq $cert.Thumbprint }
+          if (-not $have) {
+            Import-Certificate -FilePath $cerPath -CertStoreLocation $target | Out-Null
+            Ok "trusted cert imported into CurrentUser\$store"
+          } else {
+            Ok "cert already trusted in CurrentUser\$store"
+          }
+        }
+      } catch {
+        Warn "trust import failed: $($_.Exception.Message)"
+      }
+    }
+    $sig2 = Get-AuthenticodeSignature -LiteralPath $Exe
+    if ($sig2.Status -eq 'Valid') {
+      Ok "signature now Valid: $($sig2.SignerCertificate.Subject)"
+      Warn "SmartScreen reputation may still warn on first run of a new binary"
+    } elseif ($sig2.Status -eq 'UnknownError') {
+      Warn "signature UnknownError (timestamp offline?) - may still show unknown publisher"
+    } else {
+      Bad "signature after sign: $($sig2.Status)"
+    }
+  } else {
+    Bad "no code-signing certificate available"
+  }
 }
 
 # --- 3) PE header (first 2 bytes only) ---
@@ -90,7 +129,7 @@ try {
   $fs.Close()
 }
 if ($n -lt 2 -or $buf[0] -ne 0x4D -or $buf[1] -ne 0x5A) {
-  Bad ("not MZ: n={0} b0=0x{1} b1=0x{2}" -f $n, $(if ($n -gt 0) { '{0:X2}' -f $buf[0] } else { '??' }), $(if ($n -gt 1) { '{0:X2}' -f $buf[1] } else { '??' }))
+  Bad "not MZ header (n=$n)"
 } else {
   Ok ("PE/MZ ok ({0} MB)" -f [math]::Round($len / 1MB, 1))
 }
@@ -119,7 +158,7 @@ try {
   Warn "Defender query unavailable: $($_.Exception.Message)"
 }
 
-# --- 6) start/stop smoke on free port (no upstream needed) ---
+# --- 6) start/stop smoke on free port ---
 Write-Host "=== start smoke ==="
 $port = 18099
 $busy = $null
@@ -135,6 +174,7 @@ if ($busy) {
   $oldBase = $env:OPENCODE_ZEN_BASE
   $oldPool = $env:SHIM_SESSION_FILE
   $oldLog = $env:LOG_FILE
+  $p = $null
   try {
     $env:PORT = "$port"
     $env:DIRECT_DIAG = '0'
@@ -146,7 +186,6 @@ if ($busy) {
     Start-Sleep -Seconds 2
     $h = $null
     try {
-      # curl.exe -m caps total seconds; fall back to Invoke-WebRequest
       $h = & curl.exe -s -m 3 "http://127.0.0.1:$port/health" 2>$null
       if (-not $h) {
         $h = (Invoke-WebRequest -Uri "http://127.0.0.1:$port/health" -TimeoutSec 3 -UseBasicParsing).Content
