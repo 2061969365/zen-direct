@@ -63,8 +63,11 @@ func seedBuiltinTable() {
 		"minimax-m3", "minimax-m2.7", "minimax-m2.5",
 		"glm-5.3-flash", "glm-5.3", "glm-5.2", "glm-5.1", "glm-5",
 		"kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code", "kimi-k3",
-		"big-pickle", "mimo-v2.5-free", "ling-3.0-flash-fin-free",
+		"big-pickle", "mimo-v2.5-free", "mimo-v2.6-flash-free",
+		"ling-3.0-flash-fin-free",
 		"nemotron-3-ultra-free", "nemotron-3.5-lightning-free",
+		// space-bunny-free：实测仅 /chat/completions+/messages，/responses 401。
+		"space-bunny-free",
 	}
 	gemini := []string{
 		"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
@@ -104,6 +107,7 @@ func guessFormatByPrefix(model string) Format {
 		strings.HasPrefix(m, "mimo-"),
 		strings.HasPrefix(m, "ling-"),
 		strings.HasPrefix(m, "nemotron-"),
+		strings.HasPrefix(m, "space-"),
 		m == "big-pickle":
 		return FmtChat
 	}
