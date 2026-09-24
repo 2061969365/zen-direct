@@ -4,3 +4,11 @@ zen-direct
 zen-direct-linux-amd64
 zen-direct-windows-amd64.exe
 zen-direct-shadow.exe
+*.err.log
+*.err.log.*
+shim_sessions.json
+mock.pid
+gw.pid
+mock_up.py
+mock.log
+gw.log
