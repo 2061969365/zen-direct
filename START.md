@@ -39,6 +39,19 @@ bat 顶部 / ps1 `CONFIG` 区：
 | `HIDE_WINDOW` | 1 | 0=显示窗口（排查） |
 | `OPENCODE_ZEN_BASE` | `https://opencode.ai/zen/v1` | 上游 base |
 
+## 模型协议表（自动获取）
+
+网关启动时抓官方 Endpoints 表（`zen.mdx`：模型 ID → 上游路径 responses/chat/messages），
+失败则用内置快照；后台每 6h 刷新。`/health` 的 `table_models` 即当前表规模。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `ZEN_TABLE_URL` | 官方 raw 地址 | 换自建镜像 |
+| `ZEN_TABLE_REFRESH` | 开 | `0`/`false`/`off` 关闭刷新（纯快照，零外联启动） |
+| `ZEN_TABLE_INTERVAL` | `6h` | 后台刷新间隔（`30m`/`1h` 等） |
+
+网关不支持的上游端点（如 jev 的 `/systemone`）直接 400 明拒，不再透传撞上游 500。
+
 改完保存，重新双击即生效（先自动杀旧进程）。
 
 ## 行为

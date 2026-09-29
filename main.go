@@ -527,6 +527,12 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	}
 	normalizeModel(in)
 	model, _ := in["model"].(string)
+	// 网关不支持的上游端点（如 jev 的 /systemone）：400 明拒，
+	// 不再默认 responses 透传撞上游 500。
+	if ep, bad := lookupUnsupported(model); bad {
+		writeErr(w, 400, "invalid_request_error", "model requires unsupported upstream endpoint: "+ep)
+		return
+	}
 	// 路由查表用小写，透传上游保留原大小写。
 	target, ok := lookupFormat(strings.ToLower(model))
 	if !ok {
@@ -975,6 +981,7 @@ func main() {
 	apiKey = env("OPENCODE_ZEN_API_KEY", "public")
 	project = env("OPENCODE_ZEN_PROJECT", "default")
 	seedBuiltinTable()
+	tableStartRefresher() // 官方 Endpoints 表刷新（失败则沿用内置快照）
 	poolLoad()
 	if diagOn() {
 		go statsReporter(5 * time.Minute)
@@ -986,8 +993,8 @@ func main() {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		s := statsSnapshot()
-		fmt.Fprintf(w, `{"status":"ok","mode":"direct","version":%q,"stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d}}`,
-			appVersion, s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
+		fmt.Fprintf(w, `{"status":"ok","mode":"direct","version":%q,"table_models":%d,"stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d}}`,
+			appVersion, tableModelCount(), s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != "GET" {
