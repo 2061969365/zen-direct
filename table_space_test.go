@@ -17,3 +17,14 @@ func TestSpaceBunnyRoutesChat(t *testing.T) {
 		t.Fatalf("mimo-v2.6 应 chat，得 %q,%v", f, ok)
 	}
 }
+
+func TestLongcatRoutesChat(t *testing.T) {
+	seedBuiltinTable()
+	f, ok := lookupFormat("longcat-2.5-preview-free")
+	if !ok || f != FmtChat {
+		t.Fatalf("longcat-2.5-preview-free 应 chat，得 %q,%v", f, ok)
+	}
+	if f := guessFormatByPrefix("longcat-2.5-preview-free"); f != FmtChat {
+		t.Fatalf("longcat- 前缀应 chat，得 %q", f)
+	}
+}

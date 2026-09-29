@@ -68,6 +68,9 @@ func seedBuiltinTable() {
 		"nemotron-3-ultra-free", "nemotron-3.5-lightning-free",
 		// space-bunny-free：实测仅 /chat/completions+/messages，/responses 401。
 		"space-bunny-free",
+		// longcat-2.5-preview-free：实测仅 /chat（全套头+桩+none 才过门禁），
+		// /responses 与 /messages 均为上游 500。
+		"longcat-2.5-preview-free",
 	}
 	gemini := []string{
 		"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
@@ -108,6 +111,7 @@ func guessFormatByPrefix(model string) Format {
 		strings.HasPrefix(m, "ling-"),
 		strings.HasPrefix(m, "nemotron-"),
 		strings.HasPrefix(m, "space-"),
+		strings.HasPrefix(m, "longcat-"),
 		m == "big-pickle":
 		return FmtChat
 	}
