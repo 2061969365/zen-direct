@@ -178,7 +178,7 @@ jobs:
                   "instructions": "You are a helpful coding assistant." + filler,
                   "input": items,
                   "stream": True,
-                  "max_output_tokens": 64,
+                  "max_output_tokens": 1024,
               }).encode()
               print(f"shape=history rounds={n_rounds} body_bytes={len(body)}", flush=True)
           else:
@@ -219,8 +219,11 @@ jobs:
                           if tp in ("response.completed", "response.incomplete", "response.failed"):
                               terminal = tp
                               try:
-                                  out = obj.get("response", {}).get("output", [])
-                                  print(f"TERMINAL={tp} output_items={len(out)}", flush=True)
+                                  r = obj.get("response", {})
+                                  out = r.get("output", [])
+                                  det = r.get("incomplete_details", {})
+                                  kinds = [i.get("type") for i in out][:6]
+                                  print(f"TERMINAL={tp} output_items={len(out)} kinds={kinds} incomplete_details={det} usage={r.get('usage',{})}", flush=True)
                               except Exception:
                                   print(f"TERMINAL={tp}", flush=True)
                   if terminal:
