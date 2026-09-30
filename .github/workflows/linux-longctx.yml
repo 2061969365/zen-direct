@@ -24,6 +24,9 @@ on:
       live_model:
         description: 'Model for live test'
         default: 'muse-spark-1.3-contributor-free'
+      shape:
+        description: 'Input shape: flat text or grown multi-turn history'
+        default: 'history'
 jobs:
   mock-timeouts:
     runs-on: ubuntu-latest
@@ -138,13 +141,50 @@ jobs:
           import http.client, json, os, sys, time
           tokens = int(os.environ.get("TOKENS", "300000"))
           model = os.environ.get("MODEL", "muse-spark-1.3-contributor-free")
+          shape = os.environ.get("SHAPE", "history")
           # ~4 chars/token
           para = ("The quick brown fox jumps over the lazy dog. Pack my box with five dozen "
                   "liquor jugs. How vexingly quick daft zebras jump! ")
           need = tokens * 4
-          text = (para * (need // len(para) + 1))[:need]
-          print(f"input chars={len(text)} approx_tokens~{len(text)//4}", flush=True)
-          body = json.dumps({"model": model, "input": text, "stream": True}).encode()
+          if shape == "history":
+              # 模拟长出来的 harness 会话：instructions + N 轮
+              # user/assistant/function_call/function_call_output（含 reasoning 条目），
+              # 总量与 flat 相当，但结构是真实会话形状。
+              items = []
+              filler = (para * 40)[:1600]
+              per_round = 0
+              rounds = []
+              # 先估算一轮大小，再算轮数
+              one = [
+                  {"type": "message", "role": "user",
+                   "content": [{"type": "input_text", "text": filler}]},
+                  {"type": "reasoning", "id": "rs_probe",
+                   "summary": [{"type": "summary_text", "text": filler[:400]}]},
+                  {"type": "function_call", "call_id": "call_probe",
+                   "name": "read", "arguments": '{"path":"/tmp/x"}'},
+                  {"type": "function_call_output", "call_id": "call_probe",
+                   "output": filler},
+                  {"type": "message", "role": "assistant",
+                   "content": [{"type": "output_text", "text": filler[:800]}]},
+              ]
+              one_len = len(json.dumps(one))
+              n_rounds = max(1, need // one_len)
+              for i in range(n_rounds):
+                  items.extend(json.loads(json.dumps(one).replace("probe", f"p{i}")))
+              items.append({"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": "say OK"}]})
+              body = json.dumps({
+                  "model": model,
+                  "instructions": "You are a helpful coding assistant." + filler,
+                  "input": items,
+                  "stream": True,
+                  "max_output_tokens": 64,
+              }).encode()
+              print(f"shape=history rounds={n_rounds} body_bytes={len(body)}", flush=True)
+          else:
+              text = (para * (need // len(para) + 1))[:need]
+              print(f"shape=flat input chars={len(text)} approx_tokens~{len(text)//4}", flush=True)
+              body = json.dumps({"model": model, "input": text, "stream": True}).encode()
           conn = http.client.HTTPConnection("127.0.0.1", 18080, timeout=600)
           t0 = time.monotonic()
           conn.request("POST", "/v1/responses", body,
@@ -191,7 +231,7 @@ jobs:
           print(f"total={total:.1f}s terminal={terminal}", flush=True)
           sys.exit(0 if terminal == "response.completed" else 1)
           EOF
-          TOKENS=${{ inputs.tokens }} MODEL=${{ inputs.live_model }} python3 live_req.py
+          TOKENS=${{ inputs.tokens }} MODEL=${{ inputs.live_model }} SHAPE=${{ inputs.shape }} python3 live_req.py
       - name: Gateway log tail
         if: always()
         run: |
