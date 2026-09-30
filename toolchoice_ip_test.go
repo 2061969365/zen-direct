@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// 无用户工具：上游必须 tool_choice=none（桩不得被选中）。
+// 无用户工具 + 未知模型（responses 目标）：tool_choice=none（桩不得被选中）。
 func TestToolChoiceNoneWhenNoUserTools(t *testing.T) {
 	withMockUpstream(t, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n")
 	body := `{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
@@ -64,6 +64,24 @@ func TestToolChoiceNoneChatEntry(t *testing.T) {
 	// chat entry + big-pickle → target responses（chatToResponsesReq），tool_choice 应 none。
 	if up["tool_choice"] != "none" {
 		t.Fatalf("chat 无工具应 none: %v", up["tool_choice"])
+	}
+}
+
+// muse-spark 系 provider 只接受 auto：无工具时显式 auto，不发 none。
+func TestToolChoiceAutoForMuseSpark(t *testing.T) {
+	withMockUpstream(t, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n")
+	body := `{"model":"muse-spark-1.3-contributor-free","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
+	code, _ := postResponses(t, "http://x", body)
+	if code != 200 {
+		t.Fatalf("http=%d", code)
+	}
+	_, upBody, _ := getLastUp()
+	var up map[string]any
+	if err := json.Unmarshal([]byte(upBody), &up); err != nil {
+		t.Fatalf("上游体非法: %v", err)
+	}
+	if up["tool_choice"] != "auto" {
+		t.Fatalf("muse-spark 无工具应 tool_choice=auto: %v", up["tool_choice"])
 	}
 }
 

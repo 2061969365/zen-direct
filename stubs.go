@@ -63,8 +63,14 @@ var stubToolNames = []string{
 	"write",
 }
 
+// toolChoiceAutoOnly 前缀：这些模型的上游 provider 只接受 tool_choice=auto，
+// 发 none 直接 400（muse-spark-1.3-contributor-free 实测：
+// "only `\"auto\"` is supported for `tool_choice`"）。
+// 命中时 buildUpstream 显式写 auto；其余无工具请求沿用 none 硬禁。
+var toolChoiceAutoOnly = []string{"muse-spark"}
+
 // stubToolItem builds a minimal function tool entry (bodies ignored by gate).
-// description 显式禁调：桩只为过 FreeTier 门禁存在，无工具请求被注桩后，
+// description 显式禁调：桩只为过 FreeTier 门禁存在。
 // 模型若调桩名（如 bash）harness 无法执行即卡死；此句 instruction-following
 // 强的模型大概率遵守，残余风险见 README/注释（toolless 场景留意 function_call）。
 func stubToolItem(name string) map[string]any {

@@ -390,11 +390,20 @@ func buildUpstream(entry Format, target Format, in map[string]any) map[string]an
 	} else {
 		mergeChatStubTools(upReq)
 	}
-	// 无用户工具时 tool_choice=none（抄 oc2api）：桩只为过 FreeTier 门禁，
+	// 无用户工具时 tool_choice 硬禁（抄 oc2api）：桩只为过 FreeTier 门禁，
 	// never-call 描述挡不住强指令模型；硬禁选择比事后文档可靠。
 	// 客户端自带真工具时不碰其 tool_choice。
+	// 例外：部分 provider（如 muse-spark 的 Console）只接受 "auto"，
+	// 发 none 直接 400——命中 toolChoiceAutoOnly 前缀的显式 auto。
 	if !hadUserTools {
 		upReq["tool_choice"] = "none"
+		lm := strings.ToLower(getStr(in, "model"))
+		for _, p := range toolChoiceAutoOnly {
+			if strings.HasPrefix(lm, p) {
+				upReq["tool_choice"] = "auto"
+				break
+			}
+		}
 	}
 	return upReq
 }
