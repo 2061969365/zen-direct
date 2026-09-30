@@ -5,7 +5,7 @@
 # 长 prefill 下 TTFB 超限即被掐。
 #
 # job mock-timeouts: 本地 mock 上游，验证超时语义（快）：
-#   A: 响应头延迟 65s  -> 60s header timeout 掐断，期望 502
+#   A: 响应头延迟 12s + header 预算 8s -> 502（默认 120s 太大，CI 用小阈值）
 #   B: 首字节延迟 8s（首字节预算 5s）-> 期望 first byte timeout failed 帧
 #   C: 对照组，延迟 1s，期望 200 completed
 #   D: 首块立即到、中间静默 8s（间隔 5s）-> 期望 idle timeout（稳态仍在）
@@ -40,37 +40,39 @@ jobs:
       - run: go build -trimpath -ldflags '-s -w' -o zen-direct-linux-amd64 .
       - run: |
           cat > mock_slow.py <<'EOF'
-          import sys, time, json
+          import os, sys, time, json
           from http.server import BaseHTTPRequestHandler, HTTPServer
           mode = sys.argv[1] if len(sys.argv) > 1 else "fast"
+          HDR_DELAY = int(os.environ.get("MOCK_DELAY_HEADERS", "65"))
+          FIRST_DELAY = int(os.environ.get("MOCK_DELAY_FIRST", "8"))
           class H(BaseHTTPRequestHandler):
               def do_POST(self):
                   n = int(self.headers.get('Content-Length', 0))
                   self.rfile.read(n)
                   if mode == "slow-headers":
-                      time.sleep(65)
+                      time.sleep(HDR_DELAY)
                   body = ('data: {"type":"response.completed","response":{"id":"r1",'
                           '"status":"completed","output":[],"usage":{"total_tokens":1}}}\n\ndata: [DONE]\n\n')
                   if mode == "slow-first-byte":
-                      # 先发响应头，再静默 8s，最后发 SSE
+                      # 先发响应头，再静默 FIRST_DELAY s，最后发 SSE
                       self.send_response(200)
                       self.send_header('Content-Type', 'text/event-stream')
                       self.end_headers()
                       try:
-                          time.sleep(8)
+                          time.sleep(FIRST_DELAY)
                           self.wfile.write(body.encode())
                       except (BrokenPipeError, ConnectionResetError):
                           pass
                       return
                   if mode == "stall-mid":
-                      # 首块立即到，中间静默 8s（测稳态间隔超时）
+                      # 首块立即到，中间静默 FIRST_DELAY s（测稳态间隔超时）
                       self.send_response(200)
                       self.send_header('Content-Type', 'text/event-stream')
                       self.end_headers()
                       try:
                           self.wfile.write(b'data: {"type":"response.output_text.delta","delta":"hi"}\n\n')
                           self.wfile.flush()
-                          time.sleep(8)
+                          time.sleep(FIRST_DELAY)
                           self.wfile.write(body.encode())
                       except (BrokenPipeError, ConnectionResetError):
                           pass
@@ -89,12 +91,12 @@ jobs:
           HTTPServer(('127.0.0.1', 18091), H).serve_forever()
           EOF
           echo written
-      # A: 响应头 65s -> 60s header timeout 应掐断给 502
+      # A: 响应头延迟 12s + header 预算 8s -> 掐断给 502（默认 120s 太大，CI 用小阈值验证语义）
       - name: 'A: header timeout kill'
         run: |
-          python3 mock_slow.py slow-headers > mockA.log 2>&1 &
+          MOCK_DELAY_HEADERS=12 python3 mock_slow.py slow-headers > mockA.log 2>&1 &
           echo $! > mock.pid
-          OPENCODE_ZEN_BASE=http://127.0.0.1:18091 PORT=18080 SHIM_SESSION_FILE=/tmp/ci-pool.json DIRECT_DIAG=0 nohup ./zen-direct-linux-amd64 > gwA.log 2>&1 &
+          ZEN_HEADER_TIMEOUT_SEC=8 OPENCODE_ZEN_BASE=http://127.0.0.1:18091 PORT=18080 SHIM_SESSION_FILE=/tmp/ci-pool.json DIRECT_DIAG=0 nohup ./zen-direct-linux-amd64 > gwA.log 2>&1 &
           echo $! > gw.pid
           sleep 2
           code=$(curl -s -o /tmp/outA.txt -w '%{http_code}' --max-time 120 -X POST http://127.0.0.1:18080/v1/responses \
