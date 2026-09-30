@@ -1,0 +1,200 @@
+# linux-longctx: 长上下文超时复现（手动触发，不进 push 流水线）。
+#
+# 背景：300k+ 上下文在 Linux 网关上无响应，新开会话（小上下文）即恢复。
+# 嫌疑：ResponseHeaderTimeout 60s（硬编码）+ 首字节空闲 120s，
+# 长 prefill 下 TTFB 超限即被掐。
+#
+# job mock-timeouts: 本地 mock 上游，复现击杀机制（快）：
+#   A: 响应头延迟 65s  -> 60s header timeout 掐断，期望 502
+#   B: 首字节延迟 8s（STREAM_IDLE_TIMEOUT_SEC=5）-> 期望 failed 帧
+#   C: 对照组，延迟 1s，期望 200 completed
+# job live-300k: 真上游 + 真 300k tokens + muse-spark，记录 TTFB/终态。
+#   修之前期望复现失败；修之后应 200 completed。
+name: linux-longctx
+on:
+  workflow_dispatch:
+    inputs:
+      live:
+        description: 'Run live 300k upstream test (burns free quota)'
+        type: boolean
+        default: true
+      tokens:
+        description: 'Approx input tokens for live test'
+        default: '300000'
+      live_model:
+        description: 'Model for live test'
+        default: 'muse-spark-1.3-contributor-free'
+jobs:
+  mock-timeouts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - run: go build -trimpath -ldflags '-s -w' -o zen-direct-linux-amd64 .
+      - run: |
+          cat > mock_slow.py <<'EOF'
+          import sys, time, json
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          mode = sys.argv[1] if len(sys.argv) > 1 else "fast"
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get('Content-Length', 0))
+                  self.rfile.read(n)
+                  if mode == "slow-headers":
+                      time.sleep(65)
+                  body = ('data: {"type":"response.completed","response":{"id":"r1",'
+                          '"status":"completed","output":[],"usage":{"total_tokens":1}}}\n\ndata: [DONE]\n\n')
+                  if mode == "slow-first-byte":
+                      # 先发响应头，再静默 8s，最后发 SSE
+                      self.send_response(200)
+                      self.send_header('Content-Type', 'text/event-stream')
+                      self.end_headers()
+                      try:
+                          time.sleep(8)
+                          self.wfile.write(body.encode())
+                      except (BrokenPipeError, ConnectionResetError):
+                          pass
+                      return
+                  b = body.encode()
+                  self.send_response(200)
+                  self.send_header('Content-Type', 'text/event-stream')
+                  self.send_header('Content-Length', str(len(b)))
+                  self.end_headers()
+                  try:
+                      self.wfile.write(b)
+                  except (BrokenPipeError, ConnectionResetError):
+                      pass
+              def log_message(self, *a):
+                  pass
+          HTTPServer(('127.0.0.1', 18091), H).serve_forever()
+          EOF
+          echo written
+      # A: 响应头 65s -> 60s header timeout 应掐断给 502
+      - name: 'A: header timeout kill'
+        run: |
+          python3 mock_slow.py slow-headers > mockA.log 2>&1 &
+          echo $! > mock.pid
+          OPENCODE_ZEN_BASE=http://127.0.0.1:18091 PORT=18080 SHIM_SESSION_FILE=/tmp/ci-pool.json DIRECT_DIAG=0 nohup ./zen-direct-linux-amd64 > gwA.log 2>&1 &
+          echo $! > gw.pid
+          sleep 2
+          code=$(curl -s -o /tmp/outA.txt -w '%{http_code}' --max-time 120 -X POST http://127.0.0.1:18080/v1/responses \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"test/m","stream":true,"input":"hi"}')
+          echo "HTTP=$code"
+          cat /tmp/outA.txt | head -c 300; echo
+          grep -E "timeout awaiting response headers|upstream unreachable" gwA.log | head -3 || true
+          kill $(cat gw.pid) $(cat mock.pid) || true
+          test "$code" = "502"
+      # B: 首字节 8s + idle 5s -> 应收到 upstream idle timeout failed 帧
+      - name: 'B: idle timeout kill'
+        run: |
+          python3 mock_slow.py slow-first-byte > mockB.log 2>&1 &
+          echo $! > mock.pid
+          STREAM_IDLE_TIMEOUT_SEC=5 OPENCODE_ZEN_BASE=http://127.0.0.1:18091 PORT=18080 SHIM_SESSION_FILE=/tmp/ci-pool.json DIRECT_DIAG=0 nohup ./zen-direct-linux-amd64 > gwB.log 2>&1 &
+          echo $! > gw.pid
+          sleep 2
+          curl -s --max-time 60 -N -X POST http://127.0.0.1:18080/v1/responses \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"test/m","stream":true,"input":"hi"}' > /tmp/outB.txt
+          cat /tmp/outB.txt | head -c 500; echo
+          grep -E "idle timeout" gwB.log | head -3 || true
+          kill $(cat gw.pid) $(cat mock.pid) || true
+          grep -q "upstream idle timeout" /tmp/outB.txt
+      # C: 对照组应 200 completed
+      - name: 'C: control passes'
+        run: |
+          python3 mock_slow.py fast > mockC.log 2>&1 &
+          echo $! > mock.pid
+          OPENCODE_ZEN_BASE=http://127.0.0.1:18091 PORT=18080 SHIM_SESSION_FILE=/tmp/ci-pool.json DIRECT_DIAG=0 nohup ./zen-direct-linux-amd64 > gwC.log 2>&1 &
+          echo $! > gw.pid
+          sleep 2
+          curl -sf --max-time 30 -X POST http://127.0.0.1:18080/v1/responses \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"test/m","stream":false,"input":"hi"}' | grep -q '"id":"r1"'
+          kill $(cat gw.pid) $(cat mock.pid) || true
+          echo CONTROL-OK
+  live-300k:
+    if: ${{ inputs.live }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - run: go build -trimpath -ldflags '-s -w' -o zen-direct-linux-amd64 .
+      - run: |
+          PORT=18080 SHIM_SESSION_FILE=/tmp/live-pool.json DIRECT_DIAG=1 nohup ./zen-direct-linux-amd64 > gw-live.log 2>&1 &
+          echo $! > gw.pid
+          sleep 2
+          curl -sf http://127.0.0.1:18080/health
+      - name: Live 300k request
+        timeout-minutes: 30
+        run: |
+          cat > live_req.py <<'EOF'
+          import http.client, json, os, sys, time
+          tokens = int(os.environ.get("TOKENS", "300000"))
+          model = os.environ.get("MODEL", "muse-spark-1.3-contributor-free")
+          # ~4 chars/token
+          para = ("The quick brown fox jumps over the lazy dog. Pack my box with five dozen "
+                  "liquor jugs. How vexingly quick daft zebras jump! ")
+          need = tokens * 4
+          text = (para * (need // len(para) + 1))[:need]
+          print(f"input chars={len(text)} approx_tokens~{len(text)//4}", flush=True)
+          body = json.dumps({"model": model, "input": text, "stream": True}).encode()
+          conn = http.client.HTTPConnection("127.0.0.1", 18080, timeout=600)
+          t0 = time.monotonic()
+          conn.request("POST", "/v1/responses", body,
+                       {"Content-Type": "application/json",
+                        "User-Agent": "deepseek-harness/0.1.6"})
+          resp = conn.getresponse()
+          print(f"gateway status={resp.status}", flush=True)
+          if resp.status != 200:
+              print("BODY:", resp.read()[:500]); sys.exit(1)
+          first = None
+          terminal = None
+          buf = ""
+          deadline = t0 + 1500
+          while time.monotonic() < deadline:
+              chunk = resp.read(65536)
+              if not chunk:
+                  break
+              if first is None:
+                  first = time.monotonic() - t0
+                  print(f"TTFB={first:.1f}s", flush=True)
+              buf += chunk.decode("utf-8", "replace")
+              while "\n\n" in buf:
+                  ev, buf = buf.split("\n\n", 1)
+                  for line in ev.split("\n"):
+                      line = line.strip()
+                      if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
+                          try:
+                              obj = json.loads(line[5:])
+                          except Exception:
+                              continue
+                          tp = obj.get("type", "")
+                          if tp in ("response.completed", "response.incomplete", "response.failed"):
+                              terminal = tp
+                              try:
+                                  out = obj.get("response", {}).get("output", [])
+                                  print(f"TERMINAL={tp} output_items={len(out)}", flush=True)
+                              except Exception:
+                                  print(f"TERMINAL={tp}", flush=True)
+                  if terminal:
+                      break
+              if terminal:
+                  break
+          total = time.monotonic() - t0
+          print(f"total={total:.1f}s terminal={terminal}", flush=True)
+          sys.exit(0 if terminal == "response.completed" else 1)
+          EOF
+          TOKENS=${{ inputs.tokens }} MODEL=${{ inputs.live_model }} python3 live_req.py
+      - name: Gateway log tail
+        if: always()
+        run: |
+          kill $(cat gw.pid) || true
+          grep -E "non-stream|stream end|idle timeout|upstream [0-9]{3}|transport error|circuit" gw-live.log | tail -20 || true
+          tail -5 gw-live.log || true
