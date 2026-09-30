@@ -39,6 +39,20 @@ bat 顶部 / ps1 `CONFIG` 区：
 | `HIDE_WINDOW` | 1 | 0=显示窗口（排查） |
 | `OPENCODE_ZEN_BASE` | `https://opencode.ai/zen/v1` | 上游 base |
 
+## 超时（长上下文必看）
+
+网关分两段计时：**首字节等待**（prefill）与**传输间隔**分开，避免慢 prefill 被误杀。
+启动日志打印生效值（`timeouts: header=.. first_byte=.. idle=..`）。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `ZEN_HEADER_TIMEOUT_SEC` | `120` | 上游响应头等待（原硬编码 60） |
+| `ZEN_FIRST_BYTE_TIMEOUT_SEC` | `300` | 首字节等待；300k prefill 实测 15–40s，慢出口放宽 |
+| `STREAM_IDLE_TIMEOUT_SEC` | `120` | 首字节到达后的传输间隔 |
+
+首字节超时 → `upstream_first_byte_timeout` failed 帧；中途 stall → `upstream_timeout`。
+harness 见 failed 帧可安全重试（本轮内容由重试无损拿回）。
+
 ## 模型协议表（自动获取）
 
 网关启动时抓官方 Endpoints 表（`zen.mdx`：模型 ID → 上游路径 responses/chat/messages），

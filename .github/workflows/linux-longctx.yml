@@ -4,10 +4,11 @@
 # 嫌疑：ResponseHeaderTimeout 60s（硬编码）+ 首字节空闲 120s，
 # 长 prefill 下 TTFB 超限即被掐。
 #
-# job mock-timeouts: 本地 mock 上游，复现击杀机制（快）：
+# job mock-timeouts: 本地 mock 上游，验证超时语义（快）：
 #   A: 响应头延迟 65s  -> 60s header timeout 掐断，期望 502
-#   B: 首字节延迟 8s（STREAM_IDLE_TIMEOUT_SEC=5）-> 期望 failed 帧
+#   B: 首字节延迟 8s（首字节预算 5s）-> 期望 first byte timeout failed 帧
 #   C: 对照组，延迟 1s，期望 200 completed
+#   D: 首块立即到、中间静默 8s（间隔 5s）-> 期望 idle timeout（稳态仍在）
 # job live-300k: 真上游 + 真 300k tokens + muse-spark，记录 TTFB/终态。
 #   修之前期望复现失败；修之后应 200 completed。
 name: linux-longctx
@@ -61,6 +62,19 @@ jobs:
                       except (BrokenPipeError, ConnectionResetError):
                           pass
                       return
+                  if mode == "stall-mid":
+                      # 首块立即到，中间静默 8s（测稳态间隔超时）
+                      self.send_response(200)
+                      self.send_header('Content-Type', 'text/event-stream')
+                      self.end_headers()
+                      try:
+                          self.wfile.write(b'data: {"type":"response.output_text.delta","delta":"hi"}\n\n')
+                          self.wfile.flush()
+                          time.sleep(8)
+                          self.wfile.write(body.encode())
+                      except (BrokenPipeError, ConnectionResetError):
+                          pass
+                      return
                   b = body.encode()
                   self.send_response(200)
                   self.send_header('Content-Type', 'text/event-stream')
@@ -91,21 +105,36 @@ jobs:
           grep -E "timeout awaiting response headers|upstream unreachable" gwA.log | head -3 || true
           kill $(cat gw.pid) $(cat mock.pid) || true
           test "$code" = "502"
-      # B: 首字节 8s + idle 5s -> 应收到 upstream idle timeout failed 帧
-      - name: 'B: idle timeout kill'
+      # B: 首字节 8s + 首字节预算 5s -> 应收到 first byte timeout failed 帧
+      - name: 'B: first-byte timeout kill'
         run: |
           python3 mock_slow.py slow-first-byte > mockB.log 2>&1 &
           echo $! > mock.pid
-          STREAM_IDLE_TIMEOUT_SEC=5 OPENCODE_ZEN_BASE=http://127.0.0.1:18091 PORT=18080 SHIM_SESSION_FILE=/tmp/ci-pool.json DIRECT_DIAG=0 nohup ./zen-direct-linux-amd64 > gwB.log 2>&1 &
+          STREAM_IDLE_TIMEOUT_SEC=5 ZEN_FIRST_BYTE_TIMEOUT_SEC=5 OPENCODE_ZEN_BASE=http://127.0.0.1:18091 PORT=18080 SHIM_SESSION_FILE=/tmp/ci-pool.json DIRECT_DIAG=0 nohup ./zen-direct-linux-amd64 > gwB.log 2>&1 &
           echo $! > gw.pid
           sleep 2
           curl -s --max-time 60 -N -X POST http://127.0.0.1:18080/v1/responses \
             -H 'Content-Type: application/json' \
             -d '{"model":"test/m","stream":true,"input":"hi"}' > /tmp/outB.txt
           cat /tmp/outB.txt | head -c 500; echo
-          grep -E "idle timeout" gwB.log | head -3 || true
+          grep -E "timeout" gwB.log | head -3 || true
           kill $(cat gw.pid) $(cat mock.pid) || true
-          grep -q "upstream idle timeout" /tmp/outB.txt
+          grep -q "upstream first byte timeout" /tmp/outB.txt
+      # D: 首块立即到、中间静默 8s + 间隔 5s -> 应收到 idle timeout（稳态仍在 enforcement）
+      - name: 'D: steady-state idle kill'
+        run: |
+          python3 mock_slow.py stall-mid > mockD.log 2>&1 &
+          echo $! > mock.pid
+          STREAM_IDLE_TIMEOUT_SEC=5 OPENCODE_ZEN_BASE=http://127.0.0.1:18091 PORT=18080 SHIM_SESSION_FILE=/tmp/ci-pool.json DIRECT_DIAG=0 nohup ./zen-direct-linux-amd64 > gwD.log 2>&1 &
+          echo $! > gw.pid
+          sleep 2
+          curl -s --max-time 60 -N -X POST http://127.0.0.1:18080/v1/responses \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"test/m","stream":true,"input":"hi"}' > /tmp/outD.txt
+          cat /tmp/outD.txt | head -c 500; echo
+          kill $(cat gw.pid) $(cat mock.pid) || true
+          grep -q '"upstream idle timeout"' /tmp/outD.txt
+          ! grep -q 'first byte' /tmp/outD.txt
       # C: 对照组应 200 completed
       - name: 'C: control passes'
         run: |

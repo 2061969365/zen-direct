@@ -142,7 +142,7 @@ var httpClient = &http.Client{
 		Proxy:                 http.ProxyFromEnvironment,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   20,
-		ResponseHeaderTimeout: 60 * time.Second,
+		ResponseHeaderTimeout: headerTimeout(),
 		// 透明 gzip 无上限解压=压缩炸弹敞口；SSE/JSON 体小，关了只多一点带宽。
 		DisableCompression: true,
 		// 代理/VPN 常静默掐空闲 keep-alive（对端 RST/半开），池里陈连接复用即
@@ -928,8 +928,10 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int
 		}
 	}
 	timedOut := false
+	firstByte := false
 	if ib, ok := r.(*idleTimeoutBody); ok && ib.wasTimeout() {
 		timedOut = true
+		firstByte = ib.timedOutWaitingFirst()
 	}
 	log.Printf("[REQ %s] stream end bytes=%d terminal=%v done=%v upErr=%v downErr=%v ttfbMs=%d ms=%d",
 		reqID, nBytes, sawTerminal, sawDone, upErr, downErr, ttfbMs, time.Since(start).Milliseconds())
@@ -951,7 +953,11 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int
 		}
 		msg, code := "upstream stream ended without terminal event", "upstream_truncated"
 		if timedOut {
-			msg, code = "upstream idle timeout", "upstream_timeout"
+			if firstByte {
+				msg, code = "upstream first byte timeout", "upstream_first_byte_timeout"
+			} else {
+				msg, code = "upstream idle timeout", "upstream_timeout"
+			}
 		}
 		fb, _ := json.Marshal(map[string]any{"type": "response.failed",
 			"response": map[string]any{"id": reqID, "model": model, "status": "failed",
@@ -1034,6 +1040,8 @@ func main() {
 
 	addr := ":" + env("PORT", "8080")
 	log.Printf("zen-direct %s listening %s upstream %s debug=%v concurrency=%d", appVersion, addr, upstream.String(), debugOn(), fwdConcurrency())
+	log.Printf("timeouts: header=%ds first_byte=%ds idle=%ds",
+		int(headerTimeout().Seconds()), int(firstByteTimeout().Seconds()), int(streamIdleTimeout().Seconds()))
 	// WriteTimeout 不设：SSE 流可长达数分钟，写超时会掐正常流。
 	// 空闲超时 + 读头超时防慢连接占 handler。
 	srv := &http.Server{

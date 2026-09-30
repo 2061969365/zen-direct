@@ -195,10 +195,11 @@ func TestOversize413(t *testing.T) {
 	}
 }
 
-// 空闲超时掐 stall：pipe 无写端，idle 到即错。
+// 空闲超时掐 stall：pipe 无写端，首字节预算到即错。
 func TestIdleTimeoutFires(t *testing.T) {
+	t.Setenv("ZEN_FIRST_BYTE_TIMEOUT_SEC", "1")
 	pr, pw := io.Pipe()
-	// pw 永不写、也不关：读端只靠 idle 超时解脱。
+	// pw 永不写、也不关：读端只靠首字节超时解脱。
 	ir := newIdleTimeoutBody(pr, 50*time.Millisecond)
 	defer ir.Close()
 	defer pw.Close()
@@ -206,6 +207,9 @@ func TestIdleTimeoutFires(t *testing.T) {
 	_, err := ir.Read(make([]byte, 1024))
 	if err == nil {
 		t.Fatal("stall 应超时报错")
+	}
+	if !strings.Contains(err.Error(), "first byte") {
+		t.Fatalf("无字节应报首字节超时，得 %v", err)
 	}
 	if time.Since(start) > 10*time.Second {
 		t.Fatal("超时未在预期内触发")
@@ -425,14 +429,65 @@ func TestPipeSSEFailedHasCode(t *testing.T) {
 }
 
 func TestPipeSSEIdleTimeoutMsg(t *testing.T) {
+	// A: 一个字节都没有 → 首字节超时文案。
+	t.Setenv("ZEN_FIRST_BYTE_TIMEOUT_SEC", "1")
 	pr, pw := io.Pipe()
 	ir := newIdleTimeoutBody(pr, 20*time.Millisecond)
 	defer ir.Close()
 	defer pw.Close()
 	rec := httptest.NewRecorder()
 	pipeSSE(rec, ir, "req_to", "mm", 0)
-	if !strings.Contains(rec.Body.String(), "upstream idle timeout") {
-		t.Fatalf("stall应报timeout failed: %q", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "upstream first byte timeout") {
+		t.Fatalf("无字节 stall 应报首字节超时：%q", rec.Body.String())
+	}
+	// B: 首块已到、随后 stall → 间隔超时文案（首字节预算给足）。
+	t.Setenv("ZEN_FIRST_BYTE_TIMEOUT_SEC", "3600")
+	pr2, pw2 := io.Pipe()
+	ir2 := newIdleTimeoutBody(pr2, 20*time.Millisecond)
+	defer ir2.Close()
+	defer pw2.Close()
+	go func() {
+		_, _ = pw2.Write([]byte("data: {\"type\":\"response.output_text.delta\"}\n\n"))
+		time.Sleep(2 * time.Second)
+	}()
+	rec2 := httptest.NewRecorder()
+	pipeSSE(rec2, ir2, "req_to2", "mm", 0)
+	if !strings.Contains(rec2.Body.String(), "upstream idle timeout") {
+		t.Fatalf("中途 stall 应报间隔超时：%q", rec2.Body.String())
+	}
+	if strings.Contains(rec2.Body.String(), "first byte") {
+		t.Fatalf("已见首字节不得报首字节超时：%q", rec2.Body.String())
+	}
+}
+
+func TestTimeoutEnvParse(t *testing.T) {
+	oldH, oldF, oldI := os.Getenv("ZEN_HEADER_TIMEOUT_SEC"), os.Getenv("ZEN_FIRST_BYTE_TIMEOUT_SEC"), os.Getenv("STREAM_IDLE_TIMEOUT_SEC")
+	defer func() {
+		os.Setenv("ZEN_HEADER_TIMEOUT_SEC", oldH)
+		os.Setenv("ZEN_FIRST_BYTE_TIMEOUT_SEC", oldF)
+		os.Setenv("STREAM_IDLE_TIMEOUT_SEC", oldI)
+	}()
+	os.Unsetenv("ZEN_HEADER_TIMEOUT_SEC")
+	os.Unsetenv("ZEN_FIRST_BYTE_TIMEOUT_SEC")
+	os.Unsetenv("STREAM_IDLE_TIMEOUT_SEC")
+	if headerTimeout() != 120*time.Second {
+		t.Fatalf("header 缺省应 120s，得 %v", headerTimeout())
+	}
+	if firstByteTimeout() != 300*time.Second {
+		t.Fatalf("首字节缺省应 300s，得 %v", firstByteTimeout())
+	}
+	if streamIdleTimeout() != 120*time.Second {
+		t.Fatalf("间隔缺省应 120s，得 %v", streamIdleTimeout())
+	}
+	os.Setenv("ZEN_HEADER_TIMEOUT_SEC", "7")
+	os.Setenv("ZEN_FIRST_BYTE_TIMEOUT_SEC", "9")
+	os.Setenv("STREAM_IDLE_TIMEOUT_SEC", "11")
+	if headerTimeout() != 7*time.Second || firstByteTimeout() != 9*time.Second || streamIdleTimeout() != 11*time.Second {
+		t.Fatal("环境覆盖未生效")
+	}
+	os.Setenv("ZEN_HEADER_TIMEOUT_SEC", "junk")
+	if headerTimeout() != 120*time.Second {
+		t.Fatal("非法值应回缺省")
 	}
 }
 

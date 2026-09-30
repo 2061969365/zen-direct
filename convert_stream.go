@@ -52,13 +52,16 @@ func (noopFlusher) Flush() {}
 // 超时秒数读 STREAM_IDLE_TIMEOUT_SEC，缺省 120，非法值回缺省。
 type idleTimeoutBody struct {
 	rc       io.ReadCloser
-	idle     time.Duration
+	idle     time.Duration // 首字节到达后的传输间隔预算
+	first    time.Duration // 首字节等待预算
 	mu       sync.Mutex
 	timer    *time.Timer
 	timedOut bool
 	closed   bool
+	gotFirst bool
 }
 
+// streamIdleTimeout 首字节到达后的传输间隔预算：STREAM_IDLE_TIMEOUT_SEC，缺省 120。
 func streamIdleTimeout() time.Duration {
 	if v := os.Getenv("STREAM_IDLE_TIMEOUT_SEC"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -68,10 +71,37 @@ func streamIdleTimeout() time.Duration {
 	return 120 * time.Second
 }
 
+// firstByteTimeout 首字节等待预算：ZEN_FIRST_BYTE_TIMEOUT_SEC，缺省 300。
+// 长上下文 prefill（300k 实测 15-40s，慢出口更久）走这里；
+// 以前与传输间隔共用 120s，慢 prefill 首字节未到即被掐（长会话无响应主因）。
+func firstByteTimeout() time.Duration {
+	if v := os.Getenv("ZEN_FIRST_BYTE_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 300 * time.Second
+}
+
+// headerTimeout 上游响应头等待：ZEN_HEADER_TIMEOUT_SEC，缺省 120（原硬编码 60）。
+// 部分上游 prefill 完成才发头，长上下文下 60s 不够。
+func headerTimeout() time.Duration {
+	if v := os.Getenv("ZEN_HEADER_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 120 * time.Second
+}
+
 func newIdleTimeoutBody(rc io.ReadCloser, idle time.Duration) *idleTimeoutBody {
-	b := &idleTimeoutBody{rc: rc, idle: idle}
-	if idle > 0 {
-		b.timer = time.AfterFunc(idle, b.onIdle)
+	b := &idleTimeoutBody{rc: rc, idle: idle, first: firstByteTimeout()}
+	wait := b.first
+	if wait <= 0 {
+		wait = b.idle // first<=0 视为关闭首字节特判，回退旧语义
+	}
+	if wait > 0 {
+		b.timer = time.AfterFunc(wait, b.onIdle)
 	}
 	return b
 }
@@ -88,20 +118,35 @@ func (b *idleTimeoutBody) onIdle() {
 	_ = rc.Close() // 打断正在阻塞的 Read；http body 并发 Close 安全
 }
 
+func (b *idleTimeoutBody) arm(d time.Duration) {
+	if b.timer != nil {
+		if d > 0 {
+			b.timer.Reset(d)
+		} else {
+			b.timer.Stop()
+		}
+	} else if d > 0 {
+		b.timer = time.AfterFunc(d, b.onIdle)
+	}
+}
+
 func (b *idleTimeoutBody) Read(p []byte) (int, error) {
 	n, err := b.rc.Read(p)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.timedOut {
-		return 0, errors.New("upstream idle timeout")
+		if b.gotFirst {
+			return 0, errors.New("upstream idle timeout")
+		}
+		return 0, errors.New("upstream first byte timeout")
 	}
 	if b.closed {
 		return n, err
 	}
 	if n > 0 {
-		if b.timer != nil {
-			b.timer.Reset(b.idle)
-		}
+		// 首字节到达：从首字节预算切换到间隔预算。
+		b.gotFirst = true
+		b.arm(b.idle)
 	}
 	if err != nil && b.timer != nil {
 		b.timer.Stop()
@@ -125,10 +170,16 @@ func (b *idleTimeoutBody) Close() error {
 }
 
 // wasTimeout 上游是否因包体空闲超时被掐断（供 pipeSSE 定 failed 文案）。
-func (b *idleTimeoutBody) wasTimeout() bool {
-	b.mu.Lock()
+func (b *idleTimeoutBody) wasTimeout() bool {	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.timedOut
+}
+
+// timedOutWaitingFirst 超时发生时是否连首字节都没见过（prefill 阶段被掐）。
+func (b *idleTimeoutBody) timedOutWaitingFirst() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.timedOut && !b.gotFirst
 }
 
 func (s *sseSink) emit(v any) {
