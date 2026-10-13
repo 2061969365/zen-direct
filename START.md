@@ -44,10 +44,13 @@ bat 顶部 / ps1 `CONFIG` 区：
 上游免费层只认 opencode 本体建的 `ses_`（白名单制，现签假 session 必 403
 `FreeTierError`）。池失配/401-403 轮换时，网关先调本机后台 service
 （`POST /api/session`，HTTP Basic，毫秒级）现铸一对一真 session；service
-不可用才退 ACP 子进程现铸，再退 harvest 名单，最后现签。
+不可用退 harvest 名单，再退 ACP 子进程现铸，最后现签。
+401/403 烧号有 2048 上限（超了整表清零防风暴）；烧过的共享 session 别家
+fp 命中视同失配，不再复用。
 
-- service 发现：`OPENCODE_SERVICE_URL` 直钉；否则解析 `opencode service status`
-  一次并缓存（service 重启换端口后连接失败自动重发现）。
+- service 发现：`OPENCODE_SERVICE_URL` 直钉（仅回环，否则拒收防密码出内网）；
+  否则解析 `opencode service status` 一次并缓存（service 重启换端口后连接
+  失败自动重发现）。
   注意：发现只许放 launcher（用户 shell 可靠）；网关 hidden 语境下拉子进程
   必死（实测：同二进制同参，shell 全活、网关全灭），故网关内不做发现重试，
   失败即退 harvest。

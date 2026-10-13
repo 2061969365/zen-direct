@@ -670,6 +670,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		resp.Body.Close()
 		log.Printf("[REQ %s] pooled session expired, rotate and retry once", reqID)
 		poolSes, _ = poolRotate(fp)
+		upSes = poolSes // 502 分支重用：不能拿烧掉的旧 session
 		resp, err = doUpstream(poolSes, upBody)
 		if err != nil {
 			writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
@@ -689,6 +690,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 			poolSes, _ = poolRotate(fp)
 			stripForeignBlobs(in, true)
 			upBody = buildBody()
+			upSes = poolSes // 502 分支重用：body 已按新 session 重建
 			resp, err = doUpstream(poolSes, upBody)
 			if err != nil {
 				writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())

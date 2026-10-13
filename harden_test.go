@@ -781,6 +781,55 @@ func TestRetry502Once(t *testing.T) {
 	}
 }
 
+// 401 轮换后再撞 502：退避重试必须用轮换后的新 session 发（stale upSes 回归）。
+func TestRotateThen502UsesFreshSession(t *testing.T) {
+	defer cbReset()
+	oldBO := retry502Backoff
+	retry502Backoff = time.Millisecond
+	defer func() { retry502Backoff = oldBO }()
+	resetPoolForTest()
+	var mu sync.Mutex
+	var sessions []string
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		n := calls.Add(1)
+		mu.Lock()
+		sessions = append(sessions, req.Header.Get("X-Opencode-Session"))
+		mu.Unlock()
+		switch n {
+		case 1:
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":"expired"}`))
+		case 2:
+			w.WriteHeader(502)
+			_, _ = w.Write([]byte(`{"error":"flaky"}`))
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"r3","status":"completed","output":[],"usage":{"total_tokens":1}}`))
+		}
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	old := upstream
+	upstream = u
+	defer func() { upstream = old }()
+	code, _ := postResponses(t, "http://x", `{"model":"m","stream":false,"input":[{"role":"user","content":"rotate502"}]}`)
+	if code != 200 {
+		t.Fatalf("401+502 后应 200，得 %d", code)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sessions) != 3 {
+		t.Fatalf("应恰好 3 次上游调用，得 %d", len(sessions))
+	}
+	if sessions[0] == "" || sessions[1] == "" || sessions[0] == sessions[1] {
+		t.Fatalf("401 应轮换 session：%q", sessions)
+	}
+	if sessions[2] != sessions[1] {
+		t.Fatalf("502 重试应用轮换后新 session，应 %q 得 %q", sessions[1], sessions[2])
+	}
+}
+
 func TestNoRetryOn500(t *testing.T) {
 	defer cbReset()
 	var calls atomic.Int64

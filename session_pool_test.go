@@ -141,6 +141,56 @@ func TestPoolMintChainOrder(t *testing.T) {
 	}
 }
 
+// 烧号表有上限：403 风暴不无界涨内存，超了整表清零（误烧的迟早恢复）。
+func TestBadSesCapReset(t *testing.T) {
+	resetPoolForTest()
+	defer resetPoolForTest()
+	for i := 0; i < badSesCap+10; i++ {
+		markBadSesLocked("ses_burn_" + itoa(i))
+	}
+	if len(badSes) > 20 {
+		t.Fatalf("超上限应整表清零，得 %d 条", len(badSes))
+	}
+}
+
+// 命中烧号 session 视同失配：不复用不 touch，摘除后下次重借。
+func TestPoolLookupSkipsBad(t *testing.T) {
+	resetPoolForTest()
+	defer resetPoolForTest()
+	ses := poolBorrow("fp-bad")
+	markBadSesLocked(ses)
+	if got := poolLookup("fp-bad"); got != "" {
+		t.Fatalf("烧号命中应视同失配，得 %q", got)
+	}
+	if _, ok := poolMap["fp-bad"]; ok {
+		t.Fatal("烧号条目应摘除")
+	}
+}
+
+// Gen 落盘跨重启：运行期现铸真 session 不在 harvest 名单里也必须留下。
+func TestGenSurvivesReload(t *testing.T) {
+	dir := t.TempDir()
+	oldFile := poolFile
+	poolFile = filepath.Join(dir, "ses.json")
+	defer func() { poolFile = oldFile }()
+	resetPoolForTest()
+	svcMintFunc = func() string { return "ses_svc_keep001" }
+	ses := poolBorrow("fp-keep")
+	if ses != "ses_svc_keep001" {
+		t.Fatalf("应借到 svc session，得 %q", ses)
+	}
+	poolSave()
+	resetPoolForTest()
+	if err := os.WriteFile(filepath.Join(dir, "genuine_sessions.txt"), []byte("ses_other\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	poolLoad()
+	if got := poolLookup("fp-keep"); got != ses {
+		t.Fatalf("Gen 应跨重启保留，得 %q", got)
+	}
+	resetPoolForTest()
+}
+
 // 落盘 reload：重启不断链。
 func TestPoolPersistReload(t *testing.T) {
 	dir := t.TempDir()

@@ -89,6 +89,19 @@ func TestSvcMintBadID(t *testing.T) {
 	svcInvalidate()
 }
 
+// 非回环 OPENCODE_SERVICE_URL 拒收：Basic 密码不许出本机明文 HTTP。
+// 拒后退发现；发现用坏二进制必然失败，全链回空（不碰任何远端）。
+func TestSvcRefusesRemoteURL(t *testing.T) {
+	t.Setenv("OPENCODE_SERVICE_URL", "http://example.com:4096")
+	t.Setenv("OPENCODE_BIN", `C:\definitely\not\here\opencode.exe`)
+	t.Setenv("OPENCODE_SERVER_PASSWORD", "testpw")
+	svcInvalidate()
+	defer svcInvalidate()
+	if got := svcMintSession(); got != "" {
+		t.Fatalf("远端 URL 应回空，得 %q", got)
+	}
+}
+
 func TestSvcPasswordTrim(t *testing.T) {
 	t.Setenv("OPENCODE_SERVER_PASSWORD", "  testpw  ")
 	if got := svcPassword(); got != "testpw" {

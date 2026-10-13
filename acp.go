@@ -11,7 +11,9 @@ package main
 // no risk of killing the user's own ACP processes. Concurrent mints serialize
 // on acpMu (bursts queue instead of spawning N x 200MB children).
 //
-// Chain in pool Borrow/Rotate: ACP mint -> harvest file -> mintID fallback.
+// Chain in pool Borrow/Rotate: service API -> harvest file -> ACP spawn ->
+// mintID fallback. Canonical order: service (ms, 1:1 fresh) first, harvest
+// (instant, shared) second, ACP (slow spawn) third, mint (fake, 403) last.
 // ACP_OFF=1 disables ACP entirely (pure harvest behavior).
 
 import (
@@ -245,7 +247,8 @@ func acpMintSession() string {
 		acpLogFail("[acp] stdout pipe: %v", err)
 		return ""
 	}
-	cmd.Stderr = &cappedBuffer{max: 8 << 10}
+	stderr := &cappedBuffer{max: 8 << 10}
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		acpLogFail("[acp] start %s: %v", bin, err)
 		return ""
@@ -274,7 +277,7 @@ func acpMintSession() string {
 	waitErr := cmd.Wait()
 	if res.sid == "" {
 		acpLogFail("[acp] mint failed: %v timeout=%v exit=%v stderr=%.300s",
-			res.err, timedOut, waitErr, cmd.Stderr.(*cappedBuffer).String())
+			res.err, timedOut, waitErr, stderr.String())
 		return ""
 	}
 	log.Printf("[acp] minted %s in %dms", shortStr(res.sid, 20), time.Since(t0).Milliseconds())

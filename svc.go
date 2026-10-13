@@ -6,7 +6,7 @@ package main
 // (user opencode / password from service.json or OPENCODE_SERVER_PASSWORD)
 // returns a backend-known session in milliseconds: no child process, no log
 // lock contention, no orphans. First choice in the pool chain:
-// service API -> ACP spawn -> harvest file -> mintID fallback.
+// service API -> harvest file -> ACP spawn -> mintID fallback.
 //
 // Discovery: OPENCODE_SERVICE_URL env pins the address; otherwise parse
 // `opencode service status` once and cache (re-run on connection failure).
@@ -115,9 +115,18 @@ func svcDiscover() string {
 }
 
 // svcBase returns the cached service address, discovering once on demand.
+// OPENCODE_SERVICE_URL pins it but must stay loopback: the Basic password
+// would otherwise travel off-host in cleartext over plain HTTP.
 func svcBase() string {
 	if v := strings.TrimSpace(os.Getenv("OPENCODE_SERVICE_URL")); v != "" {
-		return strings.TrimRight(v, "/")
+		u := strings.TrimRight(v, "/")
+		if strings.HasPrefix(u, "http://127.0.0.1:") ||
+			strings.HasPrefix(u, "http://localhost:") ||
+			strings.HasPrefix(u, "http://[::1]:") {
+			return u
+		}
+		svcLogFail("[svc] refuse non-loopback OPENCODE_SERVICE_URL")
+		return ""
 	}
 	svcMu.Lock()
 	defer svcMu.Unlock()
