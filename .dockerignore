@@ -1,0 +1,5 @@
+.git
+*_test.go
+*.log
+genuine_sessions.txt
+shim_sessions.json
