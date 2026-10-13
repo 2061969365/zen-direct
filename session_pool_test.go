@@ -191,6 +191,18 @@ func TestGenSurvivesReload(t *testing.T) {
 	resetPoolForTest()
 }
 
+// 名单环境变量加载：无文件时也能收（容器/Railway 变量粘贴）。
+func TestGenuineLoadFromEnv(t *testing.T) {
+	resetPoolForTest()
+	t.Setenv("GENUINE_SESSION_FILE", filepath.Join(t.TempDir(), "none.txt"))
+	t.Setenv("GENUINE_SESSIONS_INLINE", "ses_env_aaa\nses_env_bbb\nbadline\n")
+	defer resetPoolForTest()
+	genuineLoad()
+	if len(genuineSessions) != 2 || !genuineSet["ses_env_aaa"] || !genuineSet["ses_env_bbb"] {
+		t.Fatalf("应从 env 加载 2 个，得 %v", genuineSessions)
+	}
+}
+
 // 落盘 reload：重启不断链。
 func TestPoolPersistReload(t *testing.T) {
 	dir := t.TempDir()

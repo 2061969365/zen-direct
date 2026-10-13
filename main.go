@@ -40,7 +40,9 @@ func env(key, def string) string {
 	return def
 }
 
-// mintIDAt 按 opencode identifier.ts 算法签发 prefix_ 开头 26 位 ID。
+// mintIDAt 按 opencode identifier.ts 原样签发 prefix_ 开头 26 位 ID，
+// 含 descending 取反（上游 FreeTier 门禁认低 12 位大计数值；ascending 小
+// 计数现签必 403，见 probe_dir/probe_rule 实测）。
 func mintIDAt(prefix string, tsMs int64) string {
 	mintMu.Lock()
 	if tsMs != mintLastTs {
@@ -51,7 +53,7 @@ func mintIDAt(prefix string, tsMs int64) string {
 	ctr := mintCounter
 	mintMu.Unlock()
 
-	current := uint64(tsMs)*0x1000 + uint64(ctr)
+	current := ^(uint64(tsMs)*0x1000 + uint64(ctr)) // descending（~now）
 	var sb [30]byte
 	copy(sb[:len(prefix)], prefix)
 	sb[len(prefix)] = '_'

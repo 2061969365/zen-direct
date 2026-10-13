@@ -39,14 +39,19 @@ bat 顶部 / ps1 `CONFIG` 区：
 | `HIDE_WINDOW` | 1 | 0=显示窗口（排查） |
 | `OPENCODE_ZEN_BASE` | `https://opencode.ai/zen/v1` | 上游 base |
 
-## 会话池（v0.5.0+：service 现铸真 session）
+## 会话池（v0.6.0+：descending 现签，零依赖）
 
-上游免费层只认 opencode 本体建的 `ses_`（白名单制，现签假 session 必 403
-`FreeTierError`）。池失配/401-403 轮换时，网关先调本机后台 service
-（`POST /api/session`，HTTP Basic，毫秒级）现铸一对一真 session；service
-不可用退 harvest 名单，再退 ACP 子进程现铸，最后现签。
-401/403 烧号有 2048 上限（超了整表清零防风暴）；烧过的共享 session 别家
-fp 命中视同失配，不再复用。
+根因（probe_dir/probe_rule/实测 8/8+2/2）：上游 FreeTier 门禁只看 session
+16 进制低 12 位——大计数值放行，ascending 小计数（1、2、3…）一律 403，
+与高位/IP/登记无关。网关现签已改为精确 descending（`~（ts*0x1000+ctr）`，
+与 identifier.ts 一致），本地现铸即过门禁，无需任何外部依赖。
+
+铸造链（各档现均可用）：service 现铸 → harvest 名单 → ACP 现铸 →
+本地 descending 现签。`Gen` 标记、烧号表、重启过滤保留。
+
+旧注：此前误判为“白名单登记制”；实测证明纯结构判定（低 12 位），
+本地 descending 现签与本体无异。service/harvest/ACP 链保留作冗余，
+裸机（Railway/容器）单二进制即满血。
 
 - service 发现：`OPENCODE_SERVICE_URL` 直钉（仅回环，否则拒收防密码出内网）；
   否则解析 `opencode service status` 一次并缓存（service 重启换端口后连接

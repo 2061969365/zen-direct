@@ -26,9 +26,9 @@ var (
 	poolTTL   = 24 * time.Hour
 	poolFile  = ""
 	poolDirty = false
-	// genuineSessions 上游白名单内的真 session（本地 opencode.db 收割，
-	// 见 harvest_genuine.py）。上游 FreeTier 门禁只认这些现签假 ses 必 403，
-	// 故借/轮换一律优先真 session；为空时回退现签（老行为，免费层 403）。
+	// genuineSessions 白名单真 session 备份（本地 opencode.db 收割）。
+	// 注：现签已修正为 descending（低 12 位大计数），本身即过门禁；
+	// 名单仅作无 service/无 ACP 环境的兜底。
 	genuineSessions []string
 	genuineSet       = map[string]bool{}
 	// badSes 401/403 下烧掉的 session（内存态，重启清空；上限防 403 风暴无界涨）。
@@ -83,31 +83,54 @@ func genuineLoad() {
 	genuineSessions = nil
 	genuineSet = map[string]bool{}
 	path := genuineFilePath()
-	b, err := os.ReadFile(path)
-	if err != nil {
+	if b, err := os.ReadFile(path); err != nil {
 		if !os.IsNotExist(err) {
 			log.Printf("[pool] genuine load %s: %v", path, err)
 		}
-		return
+	} else {
+		for _, ln := range strings.Split(string(b), "\n") {
+			s := strings.TrimSpace(ln)
+			if s == "" || strings.HasPrefix(s, "#") {
+				continue
+			}
+			if !strings.HasPrefix(s, "ses_") || len(s) < 10 {
+				continue
+			}
+			if !genuineSet[s] {
+				genuineSet[s] = true
+				genuineSessions = append(genuineSessions, s)
+			}
+			if len(genuineSessions) >= 1024 {
+				break
+			}
+		}
+		if len(genuineSessions) > 0 {
+			log.Printf("[pool] loaded %d genuine sessions from %s", len(genuineSessions), path)
+		}
 	}
-	for _, ln := range strings.Split(string(b), "\n") {
-		s := strings.TrimSpace(ln)
-		if s == "" || strings.HasPrefix(s, "#") {
-			continue
+	// GENUINE_SESSIONS_INLINE：换行分隔的真 session（容器/远端无 DB 时用，
+	// 如 Railway 变量粘贴 harvest 结果）。文件优先，变量追加。
+	if extra := os.Getenv("GENUINE_SESSIONS_INLINE"); extra != "" {
+		n0 := len(genuineSessions)
+		for _, ln := range strings.Split(extra, "\n") {
+			s := strings.TrimSpace(ln)
+			if s == "" || strings.HasPrefix(s, "#") {
+				continue
+			}
+			if !strings.HasPrefix(s, "ses_") || len(s) < 10 {
+				continue
+			}
+			if !genuineSet[s] {
+				genuineSet[s] = true
+				genuineSessions = append(genuineSessions, s)
+			}
+			if len(genuineSessions) >= 1024 {
+				break
+			}
 		}
-		if !strings.HasPrefix(s, "ses_") || len(s) < 10 {
-			continue
+		if len(genuineSessions) > n0 {
+			log.Printf("[pool] loaded %d genuine sessions from env", len(genuineSessions)-n0)
 		}
-		if !genuineSet[s] {
-			genuineSet[s] = true
-			genuineSessions = append(genuineSessions, s)
-		}
-		if len(genuineSessions) >= 1024 {
-			break
-		}
-	}
-	if len(genuineSessions) > 0 {
-		log.Printf("[pool] loaded %d genuine sessions from %s", len(genuineSessions), path)
 	}
 }
 
@@ -204,7 +227,7 @@ func poolBorrow(fp string) string {
 
 // poolBorrowEx 同 poolBorrow，多返回 isNew（首见=true，给剥 blob 用）。
 // 失配先 service 现铸（一 fp 一真 session，毫秒级），再退 harvest 名单，
-// 再退 ACP 现铸（无 service 的机器），最后现签（老行为，免费层 403）。
+// 再退 ACP 现铸（无 service 的机器），最后本地 descending 现签（已验证过门禁）。
 func poolBorrowEx(fp string) (string, bool) {
 	if s := poolLookup(fp); s != "" {
 		return s, false
