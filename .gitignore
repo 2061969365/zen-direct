@@ -7,6 +7,7 @@ zen-direct-shadow.exe
 *.err.log
 *.err.log.*
 shim_sessions.json
+genuine_sessions.txt
 mock.pid
 gw.pid
 mock_up.py

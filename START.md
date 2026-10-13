@@ -39,6 +39,43 @@ bat 顶部 / ps1 `CONFIG` 区：
 | `HIDE_WINDOW` | 1 | 0=显示窗口（排查） |
 | `OPENCODE_ZEN_BASE` | `https://opencode.ai/zen/v1` | 上游 base |
 
+## 会话池（v0.5.0+：service 现铸真 session）
+
+上游免费层只认 opencode 本体建的 `ses_`（白名单制，现签假 session 必 403
+`FreeTierError`）。池失配/401-403 轮换时，网关先调本机后台 service
+（`POST /api/session`，HTTP Basic，毫秒级）现铸一对一真 session；service
+不可用才退 ACP 子进程现铸，再退 harvest 名单，最后现签。
+
+- service 发现：`OPENCODE_SERVICE_URL` 直钉；否则解析 `opencode service status`
+  一次并缓存（service 重启换端口后连接失败自动重发现）。
+  注意：发现只许放 launcher（用户 shell 可靠）；网关 hidden 语境下拉子进程
+  必死（实测：同二进制同参，shell 全活、网关全灭），故网关内不做发现重试，
+  失败即退 harvest。
+- 认证：`OPENCODE_SERVER_PASSWORD`，缺省读 `~/.config/opencode/service.json`；
+  用户名 `OPENCODE_SERVER_USERNAME`（缺省 `opencode`）。
+- `SVC_OFF=1` 关 service 路径；`OPENCODE_BIN` 定 opencode 二进制位置。
+
+## 会话池（v0.4.x：ACP 现铸，真 session 兜底）
+
+上游免费层只认 opencode 本体建的 `ses_`（白名单制，现签假 session 必 403
+`FreeTierError`）。池失配/401-403 轮换时，网关先调本地 `opencode acp`
+（NDJSON，`initialize` + `session/new`，约 1.2s/次，仅新对话首请求付一次）
+现铸一对一真 session；失败才退 harvest 名单，最后现签。
+
+- 二进制发现：`OPENCODE_BIN` → PATH → npm 全局默认路径；找不到直接走兜底。
+- `ACP_OFF=1` 关 ACP（纯 harvest 行为）；`ACP_CWD` 定新 session 归属目录
+  （缺省网关所在目录）；`ACP_TIMEOUT_SEC` 超时（缺省 25s）。
+- 并发现铸串行排队（防 N 个 200MB 子进程齐爆）；子进程 spawn-per-mint、
+  用完即杀，无孤儿、无 pidfile。
+
+## 会话池（v0.3.3：harvest 兜底）
+
+上游免费层只认 opencode 本体用过的 `ses_`（白名单制，现签假 session 必 403
+`FreeTierError`）。启动器先跑 `harvest_genuine.py`，把本地 `opencode.db`
+里调过 Zen 的 session 倒进 `genuine_sessions.txt`；网关借池/401-403 轮换
+一律优先用它，烧号的记坏跳过。`GENUINE_SESSION_FILE` 可改名单路径，
+缺省与会话池同目录。名单缺失时回退老行为（现签，免费层 403）。
+
 ## 超时（长上下文必看）
 
 网关分两段计时：**首字节等待**（prefill）与**传输间隔**分开，避免慢 prefill 被误杀。

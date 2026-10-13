@@ -34,6 +34,21 @@ func TestNormalizeReasoningEffort(t *testing.T) {
 	}
 }
 
+// 同格式 responses 直传：非法 effort 就地归一化（防上游 400）；
+// 缺 reasoning 键时不动（沿用上游默认，不改模型行为）。
+func TestBuildUpstreamNormalizesResponsesEffort(t *testing.T) {
+	in := mustJSON(t, `{"model":"m","input":[],"reasoning":{"effort":"none"}}`)
+	out := buildUpstream(FmtResponses, FmtResponses, in)
+	if got := asStr(asMap(out["reasoning"])["effort"]); got != "high" {
+		t.Fatalf("none 应归一 high，得 %s", got)
+	}
+	in2 := mustJSON(t, `{"model":"m","input":[]}`)
+	out2 := buildUpstream(FmtResponses, FmtResponses, in2)
+	if _, ok := out2["reasoning"]; ok {
+		t.Fatalf("缺省不应加 reasoning，得 %s", canon(out2["reasoning"]))
+	}
+}
+
 func TestEffortToBudget(t *testing.T) {
 	cases := map[string]int{"low": 4096, "medium": 16000, "high": 32000, "xhigh": 48000}
 	for e, want := range cases {

@@ -40,6 +40,32 @@ $env:LOG_FILE          = $log
 $env:LOG_MAX_MB        = "$LogMaxMB"
 $env:OPENCODE_ZEN_BASE = $ZenBase
 
+# service 发现：本机后台 service 端口随机，问一次并缓存到环境。
+# 用户 shell 里 `service status` 可靠（网关自己拉子进程在 hidden 语境下必死，
+# 故发现只放 launcher）。失败即跳过（service 没跑时网关退 harvest）。
+try {
+  if (-not $env:OPENCODE_SERVICE_URL) {
+    $svcUrl = (& opencode service status 2>$null | Select-Object -First 1)
+    if ("$svcUrl".Trim() -match '^http://(127\.0\.0\.1|localhost):\d+$') {
+      $env:OPENCODE_SERVICE_URL = "$svcUrl".Trim()
+      Write-Host "service: $($env:OPENCODE_SERVICE_URL)"
+    }
+  }
+} catch {
+  Write-Host "service: undiscovered ($($_.Exception.Message))"
+}
+
+# 真 session 收割（上游免费层只认 opencode 本体用过的 session，现签假 ses 必 403）。
+# harvest_genuine.py 把本地 opencode.db 里调过 Zen 的 session 倒进 genuine_sessions.txt，
+# 网关借池优先用它；收割失败也不挡启动（回退现签，免费层 403）。
+try {
+  $py = (Get-Command python -ErrorAction Stop).Source
+  & $py (Join-Path $home_ 'harvest_genuine.py') (Join-Path $home_ 'genuine_sessions.txt') 2>&1 |
+    ForEach-Object { Write-Host "harvest: $_" }
+} catch {
+  Write-Host "harvest: skip ($($_.Exception.Message))"
+}
+
 $winStyle = if ($HideWindow) { 'Hidden' } else { 'Normal' }
 Start-Process -FilePath $exe -WindowStyle $winStyle
 Start-Sleep 2

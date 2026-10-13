@@ -4,9 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"hash/fnv"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,6 +26,15 @@ var (
 	poolTTL   = 24 * time.Hour
 	poolFile  = ""
 	poolDirty = false
+	// genuineSessions 上游白名单内的真 session（本地 opencode.db 收割，
+	// 见 harvest_genuine.py）。上游 FreeTier 门禁只认这些现签假 ses 必 403，
+	// 故借/轮换一律优先真 session；为空时回退现签（老行为，免费层 403）。
+	genuineSessions []string
+	genuineSet       = map[string]bool{}
+	// badSes 401/403 下烧掉的 session（内存态，重启随 genuine 文件重载恢复）。
+	badSes = map[string]bool{}
+	// rotateSeq 轮换盐：同 fp 连续 403 时顺序试下一个真 session。
+	rotateSeq uint64
 )
 
 type poolEntry struct {
@@ -42,6 +53,78 @@ func poolFilePath() string {
 	return filepath.Join(os.TempDir(), "shim_sessions.json")
 }
 
+// genuineFilePath 真 session 名单路径：GENUINE_SESSION_FILE 优先，
+// 缺省与会话池同目录 genuine_sessions.jsonl（harvest_genuine.py 生成）。
+func genuineFilePath() string {
+	if v := os.Getenv("GENUINE_SESSION_FILE"); v != "" {
+		return v
+	}
+	return filepath.Join(filepath.Dir(poolFilePath()), "genuine_sessions.txt")
+}
+
+// genuineLoad 读真 session 名单（无锁：仅启动 poolLoad 持锁时调，单测单线程调）。
+func genuineLoad() {
+	genuineSessions = nil
+	genuineSet = map[string]bool{}
+	path := genuineFilePath()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[pool] genuine load %s: %v", path, err)
+		}
+		return
+	}
+	for _, ln := range strings.Split(string(b), "\n") {
+		s := strings.TrimSpace(ln)
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		if !strings.HasPrefix(s, "ses_") || len(s) < 10 {
+			continue
+		}
+		if !genuineSet[s] {
+			genuineSet[s] = true
+			genuineSessions = append(genuineSessions, s)
+		}
+		if len(genuineSessions) >= 1024 {
+			break
+		}
+	}
+	if len(genuineSessions) > 0 {
+		log.Printf("[pool] loaded %d genuine sessions from %s", len(genuineSessions), path)
+	}
+}
+
+// genuineHash fp 定点散列（同 fp 跨重启落到同一真 session，保 lineage 稳定）。
+func genuineHash(fp string) uint64 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(fp))
+	return uint64(h.Sum32())
+}
+
+// pickGenuineLocked 按 fp 定点选真 session，跳过烧号；全烧/无货返回 ""。
+// 调用方须持 poolMu。
+func pickGenuineLocked(fp string, salt uint64) string {
+	n := len(genuineSessions)
+	if n == 0 {
+		return ""
+	}
+	start := (genuineHash(fp) + salt) % uint64(n)
+	for i := 0; i < n; i++ {
+		s := genuineSessions[(int(start)+i)%n]
+		if !badSes[s] {
+			return s
+		}
+	}
+	return ""
+}
+
+// pickGenuine 加锁版（轮换外/借用外调用）。
+func pickGenuine(fp string, salt uint64) string {
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	return pickGenuineLocked(fp, salt)
+}
 // fpKey 会话键。sid 非空即 hdr: 前缀（同头同键，与 body 无关）。
 func fpKey(sid, first, instructions string) string {
 	if sid != "" {
@@ -91,11 +174,22 @@ func poolBorrow(fp string) string {
 }
 
 // poolBorrowEx 同 poolBorrow，多返回 isNew（首见=true，给剥 blob 用）。
+// 失配先 service 现铸（一 fp 一真 session，毫秒级），再退 harvest 名单，
+// 再退 ACP 现铸（无 service 的机器），最后现签（老行为，免费层 403）。
 func poolBorrowEx(fp string) (string, bool) {
 	if s := poolLookup(fp); s != "" {
 		return s, false
 	}
-	ses := mintID("ses")
+	ses := svcMintFunc()
+	if ses == "" {
+		ses = acpMintFunc()
+	}
+	if ses == "" {
+		ses = pickGenuine(fp, 0)
+	}
+	if ses == "" {
+		ses = mintID("ses")
+	}
 	poolMu.Lock()
 	if e, ok := poolMap[fp]; ok {
 		e.Session = ses
@@ -135,11 +229,36 @@ func poolEvict(fp string) {
 // poolRotate 原子轮换：驱逐旧 session 并签发新 session 在同一临界区内完成。
 // 401 风暴下多并发不再互相删对方刚借到的新 session（先 evict 后 borrow 的
 // TOCTOU 在此收敛为单次轮换）。
+// 401/403 触发：旧 session 记烧号（大概率非白名单），新 session 按
+// service → harvest → ACP → 现签顺序取。
 func poolRotate(fp string) (string, bool) {
 	if fp == "" {
+		if s := svcMintFunc(); s != "" {
+			return s, true
+		}
+		if s := pickGenuine("", 0); s != "" {
+			return s, true
+		}
+		if s := acpMintFunc(); s != "" {
+			return s, true
+		}
 		return mintID("ses"), true
 	}
-	ses := mintID("ses")
+	poolMu.Lock()
+	if e, ok := poolMap[fp]; ok && e.Session != "" {
+		badSes[e.Session] = true
+	}
+	poolMu.Unlock()
+	ses := svcMintFunc()
+	if ses == "" {
+		ses = pickGenuine(fp, 0)
+	}
+	if ses == "" {
+		ses = acpMintFunc()
+	}
+	if ses == "" {
+		ses = mintID("ses")
+	}
 	poolMu.Lock()
 	delete(poolMap, fp)
 	poolMap[fp] = &poolEntry{Session: ses, LastSeen: time.Now()}
@@ -220,7 +339,10 @@ func poolSave() {
 }
 
 // poolLoad 启动加载（过滤过期、截断保 MRU）。
+// 先读真 session 名单；有真货时顺手丢弃快照里的现签假 session（必 403），
+// 对应 fp 下次请求重借真 session。
 func poolLoad() {
+	genuineLoad()
 	path := poolFilePath()
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -267,6 +389,26 @@ func poolLoad() {
 		poolMap[kv.k] = kv.e
 		poolQ = append(poolQ, kv.k)
 	}
+	if len(genuineSessions) > 0 {
+		dropped := 0
+		for k, e := range poolMap {
+			if e == nil || !genuineSet[e.Session] {
+				delete(poolMap, k)
+				dropped++
+			}
+		}
+		if dropped > 0 {
+			kept := poolQ[:0]
+			for _, k := range poolQ {
+				if _, ok := poolMap[k]; ok {
+					kept = append(kept, k)
+				}
+			}
+			poolQ = kept
+			poolDirty = true
+			log.Printf("[pool] dropped %d non-genuine sessions, genuine=%d", dropped, len(genuineSessions))
+		}
+	}
 	if len(all) > 0 {
 		log.Printf("[pool] loaded %d sessions from %s", len(all), path)
 	}
@@ -280,4 +422,12 @@ func resetPoolForTest() {
 	poolDirty = false
 	poolSaveSeq = 0
 	poolSavedSeq = 0
+	badSes = map[string]bool{}
+	rotateSeq = 0
+	genuineSessions = nil
+	genuineSet = map[string]bool{}
+	// 单测永不拉真子进程/真服务：无 acp、无 service 也能跑，CI 也不慢。
+	acpMintFunc = func() string { return "" }
+	svcMintFunc = func() string { return "" }
+	svcInvalidate()
 }

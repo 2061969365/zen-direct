@@ -387,6 +387,11 @@ func buildUpstream(entry Format, target Format, in map[string]any) map[string]an
 	hadUserTools := len(asArr(in["tools"])) > 0
 	if target == FmtResponses {
 		mergeStubTools(upReq)
+		// 同格式直传时客户端 reasoning.effort 原样透传，上游白名单外一律 400
+		//（如 effort 'none'）。有该键即归一化；缺省不动（沿用上游默认）。
+		if _, ok := upReq["reasoning"]; ok {
+			normalizeReasoningEffort(upReq)
+		}
 	} else {
 		mergeChatStubTools(upReq)
 	}
