@@ -156,7 +156,7 @@ func responsesToChatResp(in map[string]any, model string) map[string]any {
 			}
 			toolCalls = append(toolCalls, map[string]any{
 				"id": id, "type": "function",
-				"function": map[string]any{"name": getStr(item, "name"), "arguments": args},
+				"function": map[string]any{"name": unaliasToolName(getStr(item, "name")), "arguments": args},
 			})
 		case "reasoning":
 			for _, s := range asArr(item["summary"]) {
@@ -225,7 +225,7 @@ func chatToResponsesResp(in map[string]any, model string) map[string]any {
 		id := fallbackToolID(getStr(tm, "id"), i)
 		output = append(output, map[string]any{
 			"type": "function_call", "id": "fc_" + id, "call_id": id,
-			"name": getStr(fn, "name"), "arguments": args,
+			"name": unaliasToolName(getStr(fn, "name")), "arguments": args,
 		})
 	}
 	if r := asStr(msg["reasoning_content"]); r != "" {
@@ -281,7 +281,7 @@ func chatToMessagesResp(in map[string]any, model string) map[string]any {
 		toolCalls = append(toolCalls, map[string]any{
 			// P2b-7：空 id 给 fallback，Claude 强校验。
 			"type": "tool_use", "id": fallbackToolID(getStr(tm, "id"), i),
-			"name": getStr(fn, "name"), "input": parseObj(asStr(fn["arguments"])),
+			"name": unaliasToolName(getStr(fn, "name")), "input": parseObj(asStr(fn["arguments"])),
 		})
 	}
 	content = append(content, toolCalls...)
@@ -315,7 +315,7 @@ func messagesToChatResp(in map[string]any, model string) map[string]any {
 			toolCalls = append(toolCalls, map[string]any{
 				// P2b-7：空 id 给 fallback。
 				"id": fallbackToolID(getStr(bm, "id"), i), "type": "function",
-				"function": map[string]any{"name": getStr(bm, "name"), "arguments": canon(bm["input"])},
+				"function": map[string]any{"name": unaliasToolName(getStr(bm, "name")), "arguments": canon(bm["input"])},
 			})
 		}
 	}
@@ -370,7 +370,7 @@ func responsesToMessagesResp(in map[string]any, model string) map[string]any {
 			id := fallbackToolID(firstNonEmpty(getStr(item, "call_id"), getStr(item, "id")), i)
 			content = append(content, map[string]any{
 				"type": "tool_use", "id": id,
-				"name": getStr(item, "name"), "input": parseObj(asStr(item["arguments"])),
+				"name": unaliasToolName(getStr(item, "name")), "input": parseObj(asStr(item["arguments"])),
 			})
 		case "reasoning":
 			var texts []string
@@ -438,7 +438,7 @@ func messagesToResponsesResp(in map[string]any, model string) map[string]any {
 			args := canon(bm["input"])
 			output = append(output, map[string]any{
 				"type": "function_call", "id": "fc_" + id, "call_id": id,
-				"name": getStr(bm, "name"), "arguments": args,
+				"name": unaliasToolName(getStr(bm, "name")), "arguments": args,
 			})
 		}
 	}

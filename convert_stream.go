@@ -477,7 +477,7 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 				}
 				if fn := asMap(tm["function"]); len(fn) > 0 {
 					if n := getStr(fn, "name"); n != "" {
-						t.name = n
+						t.name = unaliasToolName(n)
 					}
 					t.args.WriteString(asStr(fn["arguments"]))
 					if !t.added && t.callID != "" && t.name != "" {
@@ -612,7 +612,7 @@ func streamResponsesToChat(w http.ResponseWriter, r io.Reader, model string) {
 			if id == "" {
 				id = getStr(item, "call_id")
 			}
-			t := &rctTool{index: nextIdx, callID: getStr(item, "call_id"), name: getStr(item, "name")}
+			t := &rctTool{index: nextIdx, callID: getStr(item, "call_id"), name: unaliasToolName(getStr(item, "name"))}
 			if t.callID == "" {
 				t.callID = id
 			}
@@ -821,7 +821,7 @@ func streamChatToMessages(w http.ResponseWriter, r io.Reader, model string) {
 				}
 				if fn := asMap(tm["function"]); len(fn) > 0 {
 					if n := getStr(fn, "name"); n != "" {
-						t.name = n
+						t.name = unaliasToolName(n)
 					}
 					t.pending.WriteString(asStr(fn["arguments"]))
 				}

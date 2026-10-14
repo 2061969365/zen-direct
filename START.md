@@ -48,6 +48,14 @@ bat 顶部 / ps1 `CONFIG` 区：
 门禁桩换 `shell/read` 官方描述 + 真 schema、永不发送 `tool_choice: none`
 （toolless 直接删键）、`stream_options.include_usage`。
 
+## 保留名别名（v0.7.1+：harness 真流量）
+
+上游对 `bash/edit/read/write/glob/grep/shell` 配非官方定义一律 403
+（名实相符才放行；未知名随便过；history 旧调用名同样计入）。
+网关进上游前改 neutral 别名（`zd_` 前缀，描述+参数原样保留，模型行为不变），
+回客户端时映射回去，harness 原样执行。`tool_choice` 具名同样映射。
+官方 `shell/read` 桩不受影响（harness 自带的同名会被改名让位）。
+
 ## 会话池（v0.6.0+：descending 现签，零依赖）
 
 根因（probe_dir/probe_rule/实测 8/8+2/2）：上游 FreeTier 门禁只看 session

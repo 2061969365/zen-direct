@@ -134,7 +134,11 @@ func TestStubDedupOnWire(t *testing.T) {
 			t.Fatalf("线名缺失或重复：%s x%d（共%d个tools）", n, seen[n], len(tools))
 		}
 	}
-	if seen["my_tool"] != 1 || desc["bash"] != "client tool" {
-		t.Fatalf("客户端工具未原样上游：bash=%q my_tool=%d", desc["bash"], seen["my_tool"])
+	// 碰撞名 bash 上游走别名（描述原样保留），其余原样。
+	if seen["my_tool"] != 1 || seen["zd_bash"] != 1 || seen["bash"] != 0 {
+		t.Fatalf("别名映射不对：%v", seen)
+	}
+	if desc["zd_bash"] != "client tool" {
+		t.Fatalf("别名描述应原样保留：%q", desc["zd_bash"])
 	}
 }

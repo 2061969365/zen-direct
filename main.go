@@ -399,6 +399,10 @@ func buildUpstream(entry Format, target Format, in map[string]any) map[string]an
 		delete(in, "tool_choice")
 		in["tools"] = []any{}
 	}
+	// 保留名改别名（须在注桩之前：harness 的 read/shell 让位给官方桩）。
+	if n := aliasRequestTools(upReq, target); n > 0 && debugOn() {
+		log.Printf("alias %d reserved tool(s) for upstream", n)
+	}
 	// 注桩前记录：客户端是否自带真工具。
 	if target == FmtResponses {
 		mergeStubTools(upReq)
@@ -802,6 +806,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	outBytes, _ := json.Marshal(out)
+	outBytes = restoreAliasNames(outBytes)
 	log.Printf("[REQ %s] non-stream done ttfbMs=%d ms=%d outBytes=%d",
 		reqID, ttfbMs, time.Since(reqStart).Milliseconds(), len(outBytes))
 	_, _ = w.Write(outBytes)
@@ -911,7 +916,7 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int
 				if i < 0 {
 					break
 				}
-				emit(stripCompletedToolsLine(pending[:i+1]))
+				emit(restoreAliasNames(stripCompletedToolsLine(pending[:i+1])))
 				pending = pending[i+1:]
 				if downErr != nil {
 					break
