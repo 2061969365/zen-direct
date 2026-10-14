@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -14,7 +15,7 @@ func TestMergeStubTools(t *testing.T) {
 			"parameters":  map[string]any{"type": "object"},
 		}
 	}
-	in := map[string]any{"tools": []any{mk("run_shell"), mk("bash")}}
+	in := map[string]any{"tools": []any{mk("run_shell"), mk("shell")}}
 	mergeStubTools(in)
 	items, _ := in["tools"].([]any)
 	if len(items) != len(stubToolNames)+1 {
@@ -34,11 +35,11 @@ func TestMergeStubTools(t *testing.T) {
 			t.Fatalf("重复：%s x%d", n, c)
 		}
 	}
-	// 客户端的 bash 定义必须原样保留（不能被桩覆盖），57 名必须齐。
+	// 客户端的 shell 定义必须原样保留（不能被桩覆盖），桩名必须齐。
 	for _, raw := range items {
 		m, _ := raw.(map[string]any)
-		if m["name"] == "bash" && m["description"] != "client tool" {
-			t.Fatalf("客户端 bash 被桩覆盖：%v", m["description"])
+		if m["name"] == "shell" && m["description"] != "client tool" {
+			t.Fatalf("客户端 shell 被桩覆盖：%v", m["description"])
 		}
 	}
 	for _, n := range stubToolNames {
@@ -51,6 +52,43 @@ func TestMergeStubTools(t *testing.T) {
 	mergeStubTools(empty)
 	if items, _ := empty["tools"].([]any); len(items) != len(stubToolNames) {
 		t.Fatalf("空输入应全量补桩，得 %d", len(items))
+	}
+}
+
+// 官方形态锁定：描述前缀 + 必填参数 schema，缺一即上游 403。
+func TestStubOfficialShape(t *testing.T) {
+	if len(stubToolNames) != 2 || stubToolNames[0] != "shell" || stubToolNames[1] != "read" {
+		t.Fatalf("门禁集应为 [shell read]，得 %v", stubToolNames)
+	}
+	for _, raw := range []any{stubToolItem("shell"), stubToolItem("read")} {
+		m, _ := raw.(map[string]any)
+		n := asStr(m["name"])
+		d := asStr(m["description"])
+		params := asMap(asMap(m["parameters"])["properties"])
+		if n == "shell" {
+			if !strings.HasPrefix(d, "Execute a shell command and return its output.") {
+				t.Fatalf("shell 描述前缀不对：%q", d)
+			}
+			for _, k := range []string{"command", "workdir", "timeout", "background"} {
+				if _, ok := params[k]; !ok {
+					t.Fatalf("shell 缺参数 %s", k)
+				}
+			}
+		} else {
+			if !strings.HasPrefix(d, "Read the contents of a file or directory.") {
+				t.Fatalf("read 描述前缀不对：%q", d)
+			}
+			for _, k := range []string{"path", "offset", "limit"} {
+				if _, ok := params[k]; !ok {
+					t.Fatalf("read 缺参数 %s", k)
+				}
+			}
+		}
+	}
+	// chat 形同名同定义。
+	cm, _ := chatStubToolItem("shell")["function"].(map[string]any)
+	if asStr(cm["name"]) != "shell" || !strings.HasPrefix(asStr(cm["description"]), "Execute a shell command") {
+		t.Fatalf("chat 桩形态不对：%v", cm)
 	}
 }
 

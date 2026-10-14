@@ -1,6 +1,6 @@
 package main
 
-// tool_choice=none 硬禁 + /ip 端点单测。
+// tool_choice 全路径禁 none（V2 实测）+ /ip 端点单测。
 import (
 	"encoding/json"
 	"net/http"
@@ -8,8 +8,8 @@ import (
 	"testing"
 )
 
-// 无用户工具 + 未知模型（responses 目标）：tool_choice=none（桩不得被选中）。
-func TestToolChoiceNoneWhenNoUserTools(t *testing.T) {
+// 无用户工具：tool_choice 必须缺席（V2 拒 none），桩仍须在场（门禁）。
+func TestToolChoiceOmittedWhenNoUserTools(t *testing.T) {
 	withMockUpstream(t, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n")
 	body := `{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
 	code, _ := postResponses(t, "http://x", body)
@@ -21,13 +21,13 @@ func TestToolChoiceNoneWhenNoUserTools(t *testing.T) {
 	if err := json.Unmarshal([]byte(upBody), &up); err != nil {
 		t.Fatalf("上游体非法: %v", err)
 	}
-	if up["tool_choice"] != "none" {
-		t.Fatalf("无用户工具应 tool_choice=none: %v", up["tool_choice"])
+	if _, ok := up["tool_choice"]; ok {
+		t.Fatalf("无用户工具不得发 tool_choice: %v", up["tool_choice"])
 	}
 	// 桩仍须在场（门禁）。
 	tools, _ := up["tools"].([]any)
 	if len(tools) == 0 {
-		t.Fatal("桩 tools 不得因 none 移除")
+		t.Fatal("桩 tools 不得缺席")
 	}
 }
 
@@ -49,8 +49,8 @@ func TestToolChoicePreservedWithUserTools(t *testing.T) {
 	}
 }
 
-// chat 入口同样：无 messages 外工具 → none。
-func TestToolChoiceNoneChatEntry(t *testing.T) {
+// chat 入口同样：无 messages 外工具 → tool_choice 缺席。
+func TestToolChoiceOmittedChatEntry(t *testing.T) {
 	withMockUpstream(t, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n")
 	code, _ := postChat(t, "http://x", `{"model":"big-pickle","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 	if code != 200 {
@@ -61,14 +61,14 @@ func TestToolChoiceNoneChatEntry(t *testing.T) {
 	if err := json.Unmarshal([]byte(upBody), &up); err != nil {
 		t.Fatalf("上游体非法: %v", err)
 	}
-	// chat entry + big-pickle → target responses（chatToResponsesReq），tool_choice 应 none。
-	if up["tool_choice"] != "none" {
-		t.Fatalf("chat 无工具应 none: %v", up["tool_choice"])
+	// chat entry + big-pickle → target responses（chatToResponsesReq），tool_choice 缺席。
+	if _, ok := up["tool_choice"]; ok {
+		t.Fatalf("chat 无工具不得发 tool_choice: %v", up["tool_choice"])
 	}
 }
 
-// muse-spark 系 provider 只接受 auto：无工具时显式 auto，不发 none。
-func TestToolChoiceAutoForMuseSpark(t *testing.T) {
+// muse-spark 也不再需要 auto 特例：V2 下缺席即 auto 语义（200 实测）。
+func TestToolChoiceOmittedForMuseSpark(t *testing.T) {
 	withMockUpstream(t, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n")
 	body := `{"model":"muse-spark-1.3-contributor-free","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
 	code, _ := postResponses(t, "http://x", body)
@@ -80,8 +80,8 @@ func TestToolChoiceAutoForMuseSpark(t *testing.T) {
 	if err := json.Unmarshal([]byte(upBody), &up); err != nil {
 		t.Fatalf("上游体非法: %v", err)
 	}
-	if up["tool_choice"] != "auto" {
-		t.Fatalf("muse-spark 无工具应 tool_choice=auto: %v", up["tool_choice"])
+	if _, ok := up["tool_choice"]; ok {
+		t.Fatalf("muse-spark 无工具不得发 tool_choice: %v", up["tool_choice"])
 	}
 }
 

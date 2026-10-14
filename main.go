@@ -1,6 +1,6 @@
-// zen-direct: FreeTier 直连网关 v1。
-// 配方（实测）: stream:true + tools 含 opencode 57 桩名 + 官方 UA + 合法 ses/req
-// 即可 200，无需 opencode 子进程。harness 原生 tool loop 直通。
+// zen-direct: OpenCode 免费层直连网关（V2 配方，见 oc2api v2.6.0 + 抓包验证）。
+// stream:true + stream_options.include_usage + shell/read 官方桩 +
+// V2 UA + 会话三元头 + 无 tool_choice:none 即可 200。
 // 上游恒强制 stream:true；客户端非流由网关聚 SSE（nonstream.go）。
 package main
 
@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-const zenUA = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
+const zenUA = "opencode/latest/2.0.29/cli"
 const mintChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 const mintHex = "0123456789abcdef"
 
@@ -94,15 +94,23 @@ func setDefault(h http.Header, k, v string) {
 	}
 }
 
-// setZenHeaders 上游匿名鉴权头 + 官方 UA + 合法会话。
+// setZenHeaders 上游鉴权头 + V2 UA + 会话关联头（对照 2.0.29 源码与抓包）。
+// 旧版 X-Opencode-Request 已废弃，不再发送。三元头与最终 session 一致：
+// 调用方若自带 X-Opencode-Session 则沿用，否则现签。
 func setZenHeaders(h http.Header, apiKey, project string) {
 	h.Del("Authorization")
 	h.Del("X-Api-Key")
 	h.Set("Authorization", "Bearer "+apiKey)
 	h.Set("User-Agent", zenUA)
-	setDefault(h, "X-Opencode-Client", "opencode")
-	setDefault(h, "X-Opencode-Session", mintID("ses"))
-	setDefault(h, "X-Opencode-Request", mintID("msg"))
+	ses := h.Get("X-Opencode-Session")
+	if ses == "" {
+		ses = mintID("ses")
+		h.Set("X-Opencode-Session", ses)
+	}
+	setDefault(h, "X-Opencode-Client", "cli")
+	setDefault(h, "X-Opencode-Session-Id", ses)
+	setDefault(h, "X-Session-Affinity", ses)
+	setDefault(h, "X-Session-Id", ses)
 	setDefault(h, "X-Opencode-Project", project)
 }
 
@@ -385,8 +393,13 @@ func buildUpstream(entry Format, target Format, in map[string]any) map[string]an
 	} else if entry == FmtResponses && target == FmtChat {
 		upReq = responsesToChatReq(in)
 	}
-	// 注桩前记录：客户端是否自带真工具（无真工具时硬禁桩被选中，见下）。
-	hadUserTools := len(asArr(in["tools"])) > 0
+	// V2 全路径拒绝显式 tool_choice:none：客户端禁用工具时剥掉用户工具
+	// （只剩 never-call 桩）并删除该键；自带真工具时原样透传其选择。
+	if tc, ok := in["tool_choice"]; ok && tc == "none" {
+		delete(in, "tool_choice")
+		in["tools"] = []any{}
+	}
+	// 注桩前记录：客户端是否自带真工具。
 	if target == FmtResponses {
 		mergeStubTools(upReq)
 		// 同格式直传时客户端 reasoning.effort 原样透传，上游白名单外一律 400
@@ -397,21 +410,8 @@ func buildUpstream(entry Format, target Format, in map[string]any) map[string]an
 	} else {
 		mergeChatStubTools(upReq)
 	}
-	// 无用户工具时 tool_choice 硬禁（抄 oc2api）：桩只为过 FreeTier 门禁，
-	// never-call 描述挡不住强指令模型；硬禁选择比事后文档可靠。
-	// 客户端自带真工具时不碰其 tool_choice。
-	// 例外：部分 provider（如 muse-spark 的 Console）只接受 "auto"，
-	// 发 none 直接 400——命中 toolChoiceAutoOnly 前缀的显式 auto。
-	if !hadUserTools {
-		upReq["tool_choice"] = "none"
-		lm := strings.ToLower(getStr(in, "model"))
-		for _, p := range toolChoiceAutoOnly {
-			if strings.HasPrefix(lm, p) {
-				upReq["tool_choice"] = "auto"
-				break
-			}
-		}
-	}
+	// V2 全路径拒绝显式 tool_choice:none，缺省即 auto 语义。
+	// 上方已剥离客户端 none；转换函数只透传用户自带的有效选择。
 	return upReq
 }
 
@@ -594,6 +594,8 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		// FreeTier 门禁实测要求上游 stream:true（否则 403）；
 		// 客户端非流由网关聚 SSE 回 JSON（见 nonstream.go）。
 		u["stream"] = true
+		// V2 实测配方：usage 随流回（oc2api 同款，不影响网关聚合/透传）。
+		u["stream_options"] = map[string]any{"include_usage": true}
 		b, _ := json.Marshal(u)
 		return b
 	}
@@ -632,10 +634,10 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		u.Path = singleJoin(upstream.Path, target.upstreamPath())
 		fwd, _ := http.NewRequestWithContext(req.Context(), "POST", u.String(), bytes.NewReader(body))
 		fwd.Header.Set("Content-Type", "application/json")
-		setZenHeaders(fwd.Header, apiKey, project)
 		if ses != "" {
 			fwd.Header.Set("X-Opencode-Session", ses)
 		}
+		setZenHeaders(fwd.Header, apiKey, project)
 		// 首字节计时：Do 在响应头到达后返回，即 TTFB；只采首轮（重试不覆盖）。
 		t0 := time.Now()
 		resp, err := httpClient.Do(fwd)
@@ -981,7 +983,7 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int
 
 func main() {
 	var err error
-	upstream, err = url.Parse(env("OPENCODE_ZEN_BASE", "https://opencode.ai/zen/v1"))
+	upstream, err = url.Parse(env("OPENCODE_ZEN_BASE", "https://opencode.ai/inference/v1"))
 	if err != nil {
 		log.Fatalf("OPENCODE_ZEN_BASE 非法: %v", err)
 	}
@@ -1003,7 +1005,7 @@ func main() {
 		}
 	}
 	apiKey = env("OPENCODE_ZEN_API_KEY", "public")
-	project = env("OPENCODE_ZEN_PROJECT", "default")
+	project = env("OPENCODE_ZEN_PROJECT", "global")
 	seedBuiltinTable()
 	tableStartRefresher() // 官方 Endpoints 表刷新（失败则沿用内置快照）
 	poolLoad()

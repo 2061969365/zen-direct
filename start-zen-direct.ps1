@@ -10,7 +10,7 @@ $Concurrency = '16'          # 上游并发 1-32
 $LogMaxMB    = '200'         # 日志总量硬顶 MB
 $LogKeepDays = 7             # 日志保留天数
 $HideWindow  = $true         # $false=显示窗口（排查用）
-$ZenBase     = 'https://opencode.ai/zen/v1'  # 上游 base
+$ZenBase     = 'https://opencode.ai/inference/v1'  # 上游 base（V2）
 # 会话池；$null=exe 同目录 shim_sessions.json
 $PoolFile    = $null
 # =========================================================

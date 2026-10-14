@@ -1,80 +1,39 @@
-// stubs.go: opencode tool-name allowlist (descriptions intentionally stubbed).
-// zen FreeTier gate requires these names present on stream+tools requests.
-// Generated from a captured opencode request; regenerate if the gate changes.
+// stubs.go: V2 门禁桩 shell/read（官方描述前缀 + 真参数 schema，缺一即 403）。
+// 对照 oc2api v2.6.0（抓 2.0.29 官方 tool/plugin/{shell,read}.ts）。
 package main
 
-var stubToolNames = []string{
-	"bash",
-	"cad-mcp_add_dimension",
-	"cad-mcp_audit_drawing",
-	"cad-mcp_check_advisory",
-	"cad-mcp_check_deliverables",
-	"cad-mcp_check_opening",
-	"cad-mcp_check_residential",
-	"cad-mcp_copy_by_tag",
-	"cad-mcp_dim_chain",
-	"cad-mcp_draw_arc",
-	"cad-mcp_draw_axis_grid",
-	"cad-mcp_draw_circle",
-	"cad-mcp_draw_compass",
-	"cad-mcp_draw_door",
-	"cad-mcp_draw_door_set",
-	"cad-mcp_draw_ellipse",
-	"cad-mcp_draw_furniture",
-	"cad-mcp_draw_hatch",
-	"cad-mcp_draw_leader",
-	"cad-mcp_draw_level",
-	"cad-mcp_draw_line",
-	"cad-mcp_draw_lwpolyline",
-	"cad-mcp_draw_mtext",
-	"cad-mcp_draw_polyline",
-	"cad-mcp_draw_rectangle",
-	"cad-mcp_draw_schedule_table",
-	"cad-mcp_draw_stair",
-	"cad-mcp_draw_text",
-	"cad-mcp_draw_toilet",
-	"cad-mcp_draw_wall_run",
-	"cad-mcp_draw_window",
-	"cad-mcp_erase_by_filter",
-	"cad-mcp_export_preview",
-	"cad-mcp_insert_block",
-	"cad-mcp_mirror_by_tag",
-	"cad-mcp_move_by_tag",
-	"cad-mcp_open_drawing",
-	"cad-mcp_process_command",
-	"cad-mcp_query_entities",
-	"cad-mcp_redraw_component",
-	"cad-mcp_rotate_by_tag",
-	"cad-mcp_save_drawing",
-	"cad-mcp_scale_by_tag",
-	"cad-mcp_setup_dim_style",
-	"cad-mcp_setup_layers",
-	"edit",
-	"glob",
-	"grep",
-	"list_mcp_resource_templates",
-	"list_mcp_resources",
-	"read",
-	"read_mcp_resource",
-	"skill",
-	"task",
-	"todowrite",
-	"webfetch",
-	"write",
+// V2 门禁桩：仅 shell/read，且描述前缀与参数 schema 须与官方一致，否则 403。
+// 空 schema/假描述不再放行。
+var stubToolNames = []string{"shell", "read"}
+
+// stubNeverCall 禁调后缀：桩只为过门禁存在，instruction-following 强模型遵守。
+const stubNeverCall = " Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead."
+
+// stubToolItem builds an official-shaped function tool entry (responses 扁平形态)。
+func stubToolItem(name string) map[string]any {
+	desc, params, req := stubSpec(name)
+	return map[string]any{"type": "function", "name": name, "description": desc,
+		"parameters": map[string]any{"type": "object", "properties": params,
+			"required": []any{req}, "additionalProperties": false}}
 }
 
-// toolChoiceAutoOnly 前缀：这些模型的上游 provider 只接受 tool_choice=auto，
-// 发 none 直接 400（muse-spark-1.3-contributor-free 实测：
-// "only `\"auto\"` is supported for `tool_choice`"）。
-// 命中时 buildUpstream 显式写 auto；其余无工具请求沿用 none 硬禁。
-var toolChoiceAutoOnly = []string{"muse-spark"}
-
-// stubToolItem builds a minimal function tool entry (bodies ignored by gate).
-// description 显式禁调：桩只为过 FreeTier 门禁存在。
-// 模型若调桩名（如 bash）harness 无法执行即卡死；此句 instruction-following
-// 强的模型大概率遵守，残余风险见 README/注释（toolless 场景留意 function_call）。
-func stubToolItem(name string) map[string]any {
-	return map[string]any{"type": "function", "name": name, "description": "internal capability marker, never call", "parameters": map[string]any{"type": "object", "properties": map[string]any{}}}
+// stubSpec 单桩官方定义。required 返名单（调用方包 []any）。
+func stubSpec(name string) (string, map[string]any, string) {
+	if name == "shell" {
+		return "Execute a shell command and return its output." + stubNeverCall,
+			map[string]any{
+				"command":    map[string]any{"type": "string", "description": "Shell command string to execute"},
+				"workdir":    map[string]any{"type": "string", "description": "Working directory to execute the command in"},
+				"timeout":    map[string]any{"type": "integer", "minimum": 0, "description": "Timeout in milliseconds"},
+				"background": map[string]any{"type": "boolean", "description": "Run the command in the background"},
+			}, "command"
+	}
+	return "Read the contents of a file or directory." + stubNeverCall,
+		map[string]any{
+			"path":   map[string]any{"type": "string", "description": "File or directory to read"},
+			"offset": map[string]any{"type": "integer", "minimum": 0, "description": "Starting line or directory entry (1-based)"},
+			"limit":  map[string]any{"type": "integer", "minimum": 0, "description": "Maximum lines or directory entries to read"},
+		}, "path"
 }
 
 // mergeStubTools appends missing stub names to req tools (client tools first, dedupe by name).

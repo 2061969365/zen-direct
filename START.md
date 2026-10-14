@@ -39,6 +39,15 @@ bat 顶部 / ps1 `CONFIG` 区：
 | `HIDE_WINDOW` | 1 | 0=显示窗口（排查） |
 | `OPENCODE_ZEN_BASE` | `https://opencode.ai/zen/v1` | 上游 base |
 
+## 会话与门禁（v0.7.0+：V2 配方）
+
+上游迁移到 `https://opencode.ai/inference/v1`（对照 oc2api v2.6.0 + 真机抓包），
+门禁同步收紧，网关侧对应（缺一即 403）：
+`opencode/latest/2.0.29/cli` UA、三元会话头（session/session-id/affinity，
+废 `x-opencode-request`）、`x-opencode-client: cli`、`project: global`、
+门禁桩换 `shell/read` 官方描述 + 真 schema、永不发送 `tool_choice: none`
+（toolless 直接删键）、`stream_options.include_usage`。
+
 ## 会话池（v0.6.0+：descending 现签，零依赖）
 
 根因（probe_dir/probe_rule/实测 8/8+2/2）：上游 FreeTier 门禁只看 session

@@ -20,8 +20,8 @@ REM delete logs older than N days
 set "LOG_KEEP_DAYS=7"
 REM 1 = hide window ; 0 = show window (for debugging)
 set "HIDE_WINDOW=1"
-REM upstream base URL
-set "OPENCODE_ZEN_BASE=https://opencode.ai/zen/v1"
+REM upstream base URL (V2)
+set "OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1"
 REM ------------------------------------------------------------------------
 
 set "HOME_DIR=%~dp0"

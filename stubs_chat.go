@@ -1,11 +1,12 @@
 package main
 
-// chatStubToolItem chat functions 形桩（mimo 已验：名对即可，body 忽略）。
-// description 同 responses 桩：禁调标记（见 stubs.go）。
+// chatStubToolItem chat functions 形桩（官方描述+真 schema，见 stubs.go）。
 func chatStubToolItem(name string) map[string]any {
+	desc, params, req := stubSpec(name)
 	return map[string]any{"type": "function", "function": map[string]any{
-		"name": name, "description": "internal capability marker, never call",
-		"parameters": map[string]any{"type": "object", "properties": map[string]any{}},
+		"name": name, "description": desc,
+		"parameters": map[string]any{"type": "object", "properties": params,
+			"required": []any{req}, "additionalProperties": false},
 	}}
 }
 
