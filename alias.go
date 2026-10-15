@@ -60,6 +60,32 @@ func restoreAliasNames(line []byte) []byte {
 	}
 	return line
 }
+// toolNamesForLog 提取上游请求里的工具名集合（diag 用：上游 4xx 时一眼
+// 看出是不是新增了保留名）。两种形态通吃，去重保序。
+func toolNamesForLog(upReq map[string]any) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(n string) {
+		if n == "" || seen[n] {
+			return
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	for _, raw := range asArr(upReq["tools"]) {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if n, ok := m["name"].(string); ok {
+			add(n)
+			continue
+		}
+		add(asStr(asMap(m["function"])["name"]))
+	}
+	return out
+}
+
 // aliasRequestTools 改写上游请求里的工具名（tools 定义 + 历史调用 + tool_choice），
 // 返回实际改名对数（diag 日志用）。target 只可能是 responses/chat。
 func aliasRequestTools(upReq map[string]any, target Format) int {

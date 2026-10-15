@@ -745,7 +745,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		statsAddUpstream(resp.StatusCode)
 		evictIfNewFP()
 		b, _ := io.ReadAll(io.LimitReader(ir, 256<<10))
-		log.Printf("[REQ %s] upstream %d: %.300s", reqID, resp.StatusCode, string(b))
+		log.Printf("[REQ %s] upstream %d: %.300s tools=%v", reqID, resp.StatusCode, string(b), toolNamesForLog(in))
 		if ct := resp.Header.Get("Content-Type"); ct != "" {
 			w.Header().Set("Content-Type", ct)
 		} else {

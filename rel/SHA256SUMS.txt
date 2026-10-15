@@ -1,0 +1,2 @@
+242af0d13bfcab65a0cee4ec7aed61ecbec60c9e432bb24baabad1c5c75ac22b  zen-direct.exe
+787dafb951c6d53d2a3107aa530becb86ac23ae5e5d32ab74be4428aabaa53cb  zen-direct-linux-amd64

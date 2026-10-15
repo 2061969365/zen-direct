@@ -146,3 +146,21 @@ func TestRestoreAliasNamesBytes(t *testing.T) {
 		t.Fatal("无 zd_ 行应原样（零拷贝语义可顺带）")
 	}
 }
+
+// 工具名提取：双形态通吃，去重保序（4xx 日志定位新增保留名用）。
+func TestToolNamesForLog(t *testing.T) {
+	in := map[string]any{"tools": []any{
+		map[string]any{"type": "function", "name": "bash", "description": "d"},
+		map[string]any{"type": "function",
+			"function": map[string]any{"name": "glob", "description": "d"}},
+		map[string]any{"type": "function", "name": "bash", "description": "d"},
+		"garbage",
+	}}
+	got := toolNamesForLog(in)
+	if len(got) != 2 || got[0] != "bash" || got[1] != "glob" {
+		t.Fatalf("应去重保序 [bash glob]，得 %v", got)
+	}
+	if len(toolNamesForLog(map[string]any{})) != 0 {
+		t.Fatal("空输入应空")
+	}
+}
