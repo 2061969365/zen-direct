@@ -40,15 +40,44 @@ $env:LOG_FILE          = $log
 $env:LOG_MAX_MB        = "$LogMaxMB"
 $env:OPENCODE_ZEN_BASE = $ZenBase
 
+# Run-WithTimeout：外部命令硬超时（opencode CLI 在某些语境下会永久挂起，
+# 双击快捷方式（-WindowStyle Hidden）下没有任何反馈，必须自己兜底）。
+function Run-WithTimeout([string]$File, [string[]]$Args, [int]$TimeoutSec) {
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $File
+  $psi.Arguments = ($Args | ForEach-Object { '"' + $_ + '"' }) -join ' '
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $proc = [System.Diagnostics.Process]::Start($psi)
+  $outTask = $proc.StandardOutput.ReadToEndAsync()
+  $errTask = $proc.StandardError.ReadToEndAsync()
+  if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+    try { $proc.Kill() } catch {}
+    try { $proc.WaitForExit(3000) } catch {}
+    return $null
+  }
+  return $outTask.Result
+}
+
 # service 发现：本机后台 service 端口随机，问一次并缓存到环境。
 # 用户 shell 里 `service status` 可靠（网关自己拉子进程在 hidden 语境下必死，
-# 故发现只放 launcher）。失败即跳过（service 没跑时网关退 harvest）。
+# 故发现只放 launcher）。失败/超时即跳过（service 没跑时网关退 harvest）。
 try {
   if (-not $env:OPENCODE_SERVICE_URL) {
-    $svcUrl = (& opencode service status 2>$null | Select-Object -First 1)
-    if ("$svcUrl".Trim() -match '^http://(127\.0\.0\.1|localhost):\d+$') {
-      $env:OPENCODE_SERVICE_URL = "$svcUrl".Trim()
-      Write-Host "service: $($env:OPENCODE_SERVICE_URL)"
+    $oc = (Get-Command opencode -ErrorAction SilentlyContinue).Source
+    if ($oc) {
+      $svcOut = Run-WithTimeout -File $oc -Args @('service', 'status') -TimeoutSec 8
+      $svcUrl = ("$svcOut" -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+      if ("$svcUrl".Trim() -match '^http://(127\.0\.0\.1|localhost):\d+$') {
+        $env:OPENCODE_SERVICE_URL = "$svcUrl".Trim()
+        Write-Host "service: $($env:OPENCODE_SERVICE_URL)"
+      } else {
+        Write-Host "service: not detected (gateway falls back)"
+      }
+    } else {
+      Write-Host "service: opencode CLI not on PATH"
     }
   }
 } catch {

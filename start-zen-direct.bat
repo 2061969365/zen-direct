@@ -47,12 +47,12 @@ timeout /t 2 /nobreak >nul
 REM prune old / oversized logs
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$days=%LOG_KEEP_DAYS%; $budget=%LOG_MAX_MB%; $dir='%HOME_DIR%'; Get-ChildItem (Join-Path $dir 'zen-direct-*.err.log*') -EA SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$days) } | Remove-Item -Force -EA SilentlyContinue; $sum=[long]0; Get-ChildItem (Join-Path $dir 'zen-direct-*.err.log*') -EA SilentlyContinue | Sort-Object LastWriteTime -Descending | ForEach-Object { $sum+=$_.Length; if ($sum -gt ($budget * 1MB)) { Remove-Item $_.FullName -Force -EA SilentlyContinue } }"
 
-REM service discovery: background service port is random; ask once here
-REM (spawning from inside the hidden gateway is unreliable, so discovery
-REM lives in the launcher only). Failure = service down, gateway falls
-REM back to harvest file. Manual override wins.
+REM service discovery: background service port is random; ask once here with a
+REM hard 8s timeout (opencode CLI can hang in hidden/spawned contexts and the
+REM old inline FOR loop would block the launcher forever). Failure = service
+REM down; gateway falls back to harvest file. Manual override wins.
 if not defined OPENCODE_SERVICE_URL (
-  for /f "tokens=*" %%u in ('opencode service status 2^>nul') do (
+  for /f "tokens=*" %%u in ('powershell -NoProfile -ExecutionPolicy Bypass -Command "$j = Start-Job { opencode service status 2>$null }; if (Wait-Job $j -Timeout 8) { Receive-Job $j | Select-Object -First 1 } else { Stop-Job $j }; Remove-Job $j -Force -EA SilentlyContinue" 2^>nul') do (
     echo %%u | findstr /b /c:"http://127.0.0.1:" >nul && set "OPENCODE_SERVICE_URL=%%u"
     echo %%u | findstr /b /c:"http://localhost:" >nul && set "OPENCODE_SERVICE_URL=%%u"
   )
