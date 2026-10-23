@@ -128,11 +128,12 @@ func TestFreeLimitCooldownUntilReset(t *testing.T) {
 	if diff := got - want; diff > int64(5*time.Second) || diff < int64(-5*time.Second) {
 		t.Fatalf("冷却应≈到下个重置点 %s，得 %s", time.Duration(want), time.Duration(got))
 	}
-	if d := nextFreeLimitCooldown(); d != freeLimitCooldown() {
-		t.Fatalf("再犯不叠加：期望 %s，得 %s", freeLimitCooldown(), d)
-	}
-	if d := nextFreeLimitCooldown(); d != freeLimitCooldown() {
-		t.Fatalf("第三次仍不叠加：得 %s", d)
+	// 再犯不叠加：每次都是「到同一个重置点」，允许几秒抖动（两次 time.Now 不同）。
+	for i := 0; i < 2; i++ {
+		d := nextFreeLimitCooldown()
+		if diff := int64(d) - want; diff > int64(5*time.Second) || diff < int64(-5*time.Second) {
+			t.Fatalf("第 %d 次再犯仍应≈到下个重置点 %s，得 %s", i+2, time.Duration(want), d)
+		}
 	}
 	resetFreeLimitCooldown()
 }
