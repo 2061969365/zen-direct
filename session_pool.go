@@ -556,6 +556,8 @@ func resetPoolForTest() {
 	badSes = map[string]bool{}
 	freeLimitUntil.Store(0)
 	freeLimitDur.Store(0)
+	freeLimitIP.Store("")
+	freeLimitIPCheck.Store(0)
 	// 单测的烧号名单写到独立临时文件，绝不碰生产的 poisoned_sessions.txt。
 	badSesFile = filepath.Join(os.TempDir(), "zen-direct-test-poisoned.txt")
 	_ = os.Remove(badSesFile)

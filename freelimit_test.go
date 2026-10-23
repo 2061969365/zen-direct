@@ -135,6 +135,71 @@ func TestFreeLimitCooldownEscalates(t *testing.T) {
 	}
 }
 
+// 冷却绑定出口 IP：换了干净 IP 立刻放行（人工换线路的用法）。
+func TestCooldownClearedOnIPChange(t *testing.T) {
+	resetPoolForTest()
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"r1","status":"completed","output":[]}`)
+	}))
+	defer srv.Close()
+	old := upstream
+	upstream = mustParseURL(t, srv.URL)
+	defer func() { upstream = old }()
+
+	freeLimitUntil.Store(time.Now().Add(10 * time.Minute).UnixMilli())
+	freeLimitIP.Store("1.1.1.1")
+	freeLimitIPCheck.Store(0)
+	orig := egressIPFunc
+	egressIPFunc = func() string { return "2.2.2.2" }
+	defer func() { egressIPFunc = orig }()
+
+	code, body := postResponses(t, "http://x",
+		`{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":"new ip"}]}`)
+	if code != 200 {
+		t.Fatalf("换 IP 后应放行，得 %d %.200s", code, body)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("换 IP 后应打上游一次，得 %d", calls.Load())
+	}
+	if _, blocked := freeLimitBlocked(); blocked {
+		t.Fatal("换 IP 后冷却应被清掉")
+	}
+}
+
+// 同一个 IP 上冷却照旧生效。
+func TestCooldownHoldsOnSameIP(t *testing.T) {
+	resetPoolForTest()
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"r1","status":"completed","output":[]}`)
+	}))
+	defer srv.Close()
+	old := upstream
+	upstream = mustParseURL(t, srv.URL)
+	defer func() { upstream = old }()
+
+	freeLimitUntil.Store(time.Now().Add(10 * time.Minute).UnixMilli())
+	freeLimitIP.Store("1.1.1.1")
+	freeLimitIPCheck.Store(0)
+	orig := egressIPFunc
+	egressIPFunc = func() string { return "1.1.1.1" }
+	defer func() { egressIPFunc = orig }()
+
+	code, _ := postResponses(t, "http://x",
+		`{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":"same ip"}]}`)
+	if code != 429 {
+		t.Fatalf("同 IP 冷却期应 429，得 %d", code)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("同 IP 冷却期不得打上游，得 %d", calls.Load())
+	}
+}
+
 // 非免费额度的 429（真限流）不记毒、不换号、不冷却，原样透传。
 func TestNonFreeLimit429Passthru(t *testing.T) {
 	resetPoolForTest()

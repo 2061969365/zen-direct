@@ -401,6 +401,65 @@ func resetFreeLimitCooldown() {
 	}
 }
 
+// 冷却绑定的是“哪个出口 IP 被连坐”。换线路后冷却必须立刻失效，否则换了干净
+// IP 还要白等 10 分钟——人工换 IP 的用法等于被网关自己废掉。
+var (
+	freeLimitIP      atomic.Value // string：中招时的出口 IP
+	freeLimitIPCheck atomic.Int64 // 上次探测时间（unix ms）
+)
+
+// egressIP 短超时探当前出口 IP（复用 /ip 的多源）。
+func egressIP() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	type res struct {
+		ip  string
+		err error
+	}
+	ch := make(chan res, len(ipProviders))
+	for _, src := range ipProviders {
+		src := src
+		go func() {
+			ip, err := fetchIPFrom(ctx, src)
+			ch <- res{ip, err}
+		}()
+	}
+	for i := 0; i < len(ipProviders); i++ {
+		select {
+		case <-ctx.Done():
+			return ""
+		case r := <-ch:
+			if r.err == nil && r.ip != "" {
+				return r.ip
+			}
+		}
+	}
+	return ""
+}
+
+// egressIPFunc 便于单测替换。
+var egressIPFunc = egressIP
+
+// egressIPChanged 冷却期内偶尔探一次出口 IP（5s 节流，只在冷却期调用，
+// 正常请求零成本）。变了即认为已换干净线路，冷却作废。
+func egressIPChanged() (oldIP, curIP string, changed bool) {
+	now := time.Now().UnixMilli()
+	if now-freeLimitIPCheck.Load() < 5000 {
+		return "", "", false
+	}
+	freeLimitIPCheck.Store(now)
+	curIP = egressIPFunc()
+	oldIP, _ = freeLimitIP.Load().(string)
+	if curIP == "" {
+		return oldIP, curIP, false
+	}
+	if oldIP == "" { // 中招时没探到，先把当前值当基准
+		freeLimitIP.Store(curIP)
+		return "", curIP, false
+	}
+	return oldIP, curIP, oldIP != curIP
+}
+
 // freeLimitBlocked 冷却剩余时间；未冷却返回 0,false。
 func freeLimitBlocked() (time.Duration, bool) {
 	until := freeLimitUntil.Load()
@@ -745,11 +804,16 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	// 都 429，继续打只会把新 session 也烧了。直接回 429 + Retry-After，不打上游。
 	if apiKey == "public" || apiKey == "" {
 		if left, blocked := freeLimitBlocked(); blocked {
-			secs := int(left.Seconds()) + 1
-			w.Header().Set("Retry-After", strconv.Itoa(secs))
-			log.Printf("[REQ %s] free-limit cooldown, %ds left, short-circuit", reqID, secs)
-			writeErr(w, 429, "free_limit_cooldown", fmt.Sprintf("upstream free-tier quota exhausted; retry in %ds", secs))
-			return
+			if oldIP, newIP, changed := egressIPChanged(); changed {
+				log.Printf("[REQ %s] egress ip %s -> %s, free-limit cooldown cleared", reqID, oldIP, newIP)
+				freeLimitUntil.Store(0)
+			} else {
+				secs := int(left.Seconds()) + 1
+				w.Header().Set("Retry-After", strconv.Itoa(secs))
+				log.Printf("[REQ %s] free-limit cooldown, %ds left, short-circuit", reqID, secs)
+				writeErr(w, 429, "free_limit_cooldown", fmt.Sprintf("upstream free-tier quota exhausted; retry in %ds", secs))
+				return
+			}
 		}
 	}
 	resp, err := doUpstream(upSes, upBody)
@@ -791,6 +855,8 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 			if cd > 0 {
 				freeLimitUntil.Store(time.Now().Add(cd).UnixMilli())
 			}
+			// 记下中招时的出口 IP（异步，不拖慢这个 429 响应）：换了线路就解冷却。
+			go func() { freeLimitIP.Store(egressIPFunc()) }()
 			freeLimitCount.Add(1)
 			oldSes := upSes
 			poolMu.Lock()
