@@ -1,0 +1,103 @@
+name: cli-vs-gateway
+
+# 同一台 runner、同一个出口 IP 上依次跑：
+#   1) 网关（DSH 形状，不带 X-Session-Id）
+#   2) 真实 opencode CLI
+#   3) 网关再来一次
+# 判定：
+#   CLI 200 + 网关 429  → 网关请求形状/指纹有问题（与 IP 无关）
+#   CLI 429 + 网关 429  → 这个 IP 的免费额度已用完，网关无辜
+#   CLI 200 + 网关 200  → 都正常（那就是本地 IP 的问题）
+
+on:
+  workflow_dispatch:
+
+jobs:
+  same-ip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: install opencode CLI
+        run: |
+          npm install -g @opencode/cli@latest 2>&1 | tail -2
+          opencode --version
+      - name: egress IP
+        run: curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; j=json.load(sys.stdin); print(j["query"], j["city"])'
+      - name: gateway -> CLI -> gateway on one IP
+        run: |
+          set -u
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export OPENCODE_DISABLE_AUTOUPDATE=1
+          W="$PWD/_cv"; mkdir -p "$W"
+          : > "$W/genuine.txt"
+          go build -trimpath -o zen-direct .
+
+          nohup env \
+            PORT=18081 \
+            OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1 \
+            DIRECT_FRESH_PER_TURN=0 \
+            DIRECT_DEBUG=1 \
+            DIRECT_DIAG=1 \
+            LOG_FILE="$W/gw.log" \
+            SHIM_SESSION_FILE="$W/shim.json" \
+            DIRECT_POISON_FILE="$W/poison.txt" \
+            GENUINE_SESSION_FILE="$W/genuine.txt" \
+            ./zen-direct >"$W/gw.err" 2>&1 &
+          GW=$!
+          for i in $(seq 1 60); do
+            curl -sf -m 2 http://127.0.0.1:18081/health >/dev/null 2>&1 && break
+            sleep 0.3
+          done
+          echo "health: $(curl -s -m 5 http://127.0.0.1:18081/health)"
+
+          cat > "$W/post.py" <<'PY'
+          import json, random, sys, time, urllib.request, urllib.error
+          tag = sys.argv[1]; text = sys.argv[2]
+          body = json.dumps({"model": "deepseek-v4.1-flash-free", "stream": False,
+                             "messages": [{"role": "system",
+                                           "content": "You are an AI agent powered by DeepSeek Harness."},
+                                          {"role": "user", "content": text}]}).encode()
+          req = urllib.request.Request("http://127.0.0.1:18081/v1/chat/completions",
+                                       data=body, method="POST")
+          req.add_header("Content-Type", "application/json")
+          t0 = time.time()
+          try:
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  print("%s -> %s %.1fs %r" % (tag, r.status, time.time()-t0, r.read(120)[:120]))
+          except urllib.error.HTTPError as e:
+              print("%s -> %s %.1fs %r retry-after=%s" % (
+                  tag, e.code, time.time()-t0, e.read(300)[:300],
+                  e.headers.get("Retry-After")))
+          except Exception as e:
+              print("%s -> ERR %s" % (tag, e))
+          PY
+
+          echo "=== phase 1: gateway on a fresh IP ==="
+          python3 "$W/post.py" "GW-1" "same-ip gateway check 101"
+          sleep 1
+          python3 "$W/post.py" "GW-2" "same-ip gateway check 202"
+
+          echo "=== phase 2: real opencode CLI, same runner/IP ==="
+          timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free \
+            "Reply with the single word: ok" >"$W/cli.out" 2>"$W/cli.err"
+          echo "cli_exit=$?"
+          echo "--- cli stdout ---"; tail -5 "$W/cli.out"
+          echo "--- cli stderr (filtered) ---"
+          grep -Ei 'error|429|free|limit|status' "$W/cli.err" | tail -12 || true
+
+          echo "=== phase 3: gateway again, same IP ==="
+          python3 "$W/post.py" "GW-3" "same-ip gateway check 303"
+
+          echo "=== gateway log ==="
+          grep -E '\[REQ|free-usage|session policy' "$W/gw.log" \
+            | sed -E 's/ debug upBody.*//' | tail -30
+          kill "$GW" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cli-vs-gateway
+          path: _cv
