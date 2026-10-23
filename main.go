@@ -363,40 +363,53 @@ var (
 	freeLimitDur   atomic.Int64 // 当前冷却时长（ns），成功一次归零，再犯翻倍
 )
 
-// 封顶 6 小时：升级档只在「冷却到期又被 429」时翻倍，是有证据才加码；
-// 45 → 90 → 180 → 360 分钟，够覆盖连坐 + 每日额度重置（07:59）之前的空窗。
-const freeLimitDurCap = 6 * time.Hour
+// 免费额度窗口：北京时间每天 07:59 重置。额度按上游 session 计，打满的
+// session 要到第二天这个点才解开；用它打一次而被连坐的出口 IP 同理。
+// 所以冷却不是“几分钟”的事——短冷却只会拿新 session 去撞墙，撞一次再连坐一次。
+const (
+	freeResetHour = 7
+	freeResetMin  = 59
+)
 
-// freeLimitCooldown 基础冷却时长，默认 45 分钟。实测（GitHub Actions
-// poison-decay-sparse，2026-10-23）：碰一次毒 session 之后，同一出口 IP 上
-// 全新 session 在 +5/+15/+30/+45 分钟全是 429——连坐期不是早先估的 7 分钟，
-// 而是 ≥45 分钟。冷却太短只会拿新 session 去撞，撞一次再连坐一次。
+var freeResetZone = time.FixedZone("CST", 8*3600)
+
+// nextFreeReset 下一个窗口重置时刻（北京 07:59）。
+func nextFreeReset(now time.Time) time.Time {
+	n := now.In(freeResetZone)
+	r := time.Date(n.Year(), n.Month(), n.Day(), freeResetHour, freeResetMin, 0, 0, freeResetZone)
+	if !n.Before(r) {
+		r = r.AddDate(0, 0, 1)
+	}
+	return r
+}
+
+// lastFreeReset 最近一次已经过去的重置时刻。
+func lastFreeReset(now time.Time) time.Time {
+	return nextFreeReset(now).AddDate(0, 0, -1)
+}
+
+// freeLimitCooldown 冷却时长：默认封到下一次窗口重置（北京 07:59）。
 // 换出口 IP 会立刻解除冷却（见 freeLimitIP），手动切线路不受此限。
-// DIRECT_FREELIMIT_COOLDOWN 秒可调。
+// DIRECT_FREELIMIT_COOLDOWN 秒可调（0=不冷却，测试/探针用）。
 func freeLimitCooldown() time.Duration {
 	if v := os.Getenv("DIRECT_FREELIMIT_COOLDOWN"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			return time.Duration(n) * time.Second
 		}
 	}
-	return 45 * time.Minute
+	if d := time.Until(nextFreeReset(time.Now())); d > 0 {
+		return d
+	}
+	return time.Minute
 }
 
-// nextFreeLimitCooldown 冷却期内又中一次说明 IP 还没解禁：翻倍再等。
-// 连续成功后由 resetFreeLimitCooldown 归零。
+// nextFreeLimitCooldown 下一次 429 的冷却：同样封到窗口重置，不叠加翻倍。
+// 冷却期内请求走本地短路，根本打不到上游；还能再吃到 429 只可能是换了出口
+// IP，而新 IP 也在连坐期，封到同一个重置点即可。
 func nextFreeLimitCooldown() time.Duration {
-	base := int64(freeLimitCooldown())
-	cur := freeLimitDur.Load()
-	if cur == 0 {
-		cur = base
-	} else {
-		cur *= 2
-	}
-	if cur > int64(freeLimitDurCap) {
-		cur = int64(freeLimitDurCap)
-	}
-	freeLimitDur.Store(cur)
-	return time.Duration(cur)
+	cd := freeLimitCooldown()
+	freeLimitDur.Store(int64(cd))
+	return cd
 }
 
 // resetFreeLimitCooldown 上游 200 后清零升级档（下一个 429 从基础值起算）。

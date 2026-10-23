@@ -54,6 +54,31 @@ const badSesCap = 2048
 // badSesFile 单测覆盖用（resetPoolForTest 指到临时文件，不碰生产名单）。
 var badSesFile = ""
 
+// poisonResetAt 这批毒号失效的时刻（下一次窗口重置）。到点整表清空、文件删除：
+// 打满的 session 是“今天用完”，不是永久报废。
+var poisonResetAt time.Time
+
+// poisonExpireLocked 过点即清空毒名单。调用方须持 poolMu。
+func poisonExpireLocked(now time.Time) {
+	if poisonResetAt.IsZero() {
+		poisonResetAt = nextFreeReset(now)
+		return
+	}
+	if now.Before(poisonResetAt) {
+		return
+	}
+	n := len(badSes)
+	badSes = map[string]bool{}
+	badSesPrefix = nil
+	poisonResetAt = nextFreeReset(now)
+	if n > 0 {
+		log.Printf("[pool] free window reset, dropped %d poisoned sessions", n)
+	}
+	if err := os.Remove(badSesFilePath()); err != nil && !os.IsNotExist(err) {
+		log.Printf("[pool] poison reset %s: %v", badSesFilePath(), err)
+	}
+}
+
 func badSesFilePath() string {
 	if badSesFile != "" {
 		return badSesFile
@@ -67,15 +92,31 @@ func badSesFilePath() string {
 // badSesLoad 启动时读烧号名单（poolLoad 内先于快照加载调用）。
 func badSesLoad() {
 	path := badSesFilePath()
+	now := time.Now()
+	// 上一轮窗口留下的名单：整份作废（里面的号已经解禁，留着只会误杀）。
+	if st, err := os.Stat(path); err == nil && st.ModTime().Before(lastFreeReset(now)) {
+		log.Printf("[pool] poison list %s predates the last reset, dropping", path)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("[pool] poison drop %s: %v", path, err)
+		}
+		poolMu.Lock()
+		poisonResetAt = nextFreeReset(now)
+		poolMu.Unlock()
+		return
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Printf("[pool] poison load %s: %v", path, err)
 		}
+		poolMu.Lock()
+		poisonResetAt = nextFreeReset(now)
+		poolMu.Unlock()
 		return
 	}
 	poolMu.Lock()
 	defer poolMu.Unlock()
+	poisonResetAt = nextFreeReset(now)
 	n := 0
 	for _, ln := range strings.Split(string(b), "\n") {
 		s := strings.TrimSpace(ln)
@@ -113,7 +154,9 @@ func badSesAddLocked(s string) bool {
 
 // isBadSesLocked 精确命中，或以名单里的残条为前缀，即判毒。调用方须持 poolMu。
 // 前缀比对只对 len(p) < len(s) 生效：全长 id 互不为前缀，故不误伤。
+// 顺带做窗口重置检查：到点整表作废，毒号第二天自动解禁。
 func isBadSesLocked(s string) bool {
+	poisonExpireLocked(time.Now())
 	if s == "" {
 		return false
 	}
@@ -152,6 +195,7 @@ func markBadSesLocked(s string) {
 	if s == "" {
 		return
 	}
+	poisonExpireLocked(time.Now())
 	if badSes[s] {
 		return
 	}
@@ -666,6 +710,7 @@ func resetPoolForTest() {
 	poolSavedSeq = 0
 	badSes = map[string]bool{}
 	badSesPrefix = nil
+	poisonResetAt = nextFreeReset(time.Now())
 	freeLimitUntil.Store(0)
 	freeLimitDur.Store(0)
 	freeLimitIP.Store("")

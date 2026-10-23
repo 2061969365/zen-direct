@@ -115,24 +115,74 @@ func TestFreeLimitCooldownShortCircuits(t *testing.T) {
 	}
 }
 
-// 冷却时长升级：连犯翻倍、封顶 40 分钟，成功一次归零。
-func TestFreeLimitCooldownEscalates(t *testing.T) {
+// 冷却时长：封到下一次窗口重置（北京 07:59），不翻倍、不封顶——额度是日窗口，
+// 短冷却只会拿新 session 去撞墙。
+func TestFreeLimitCooldownUntilReset(t *testing.T) {
 	resetPoolForTest()
-	base := freeLimitCooldown()
-	d1 := nextFreeLimitCooldown()
-	if d1 != base {
-		t.Fatalf("首次冷却应为基础值 %s，得 %s", base, d1)
+	now := time.Now()
+	want := int64(time.Until(nextFreeReset(now)))
+	if want <= 0 {
+		t.Fatalf("到下个重置点应为正时长，得 %s", time.Duration(want))
 	}
-	if d2 := nextFreeLimitCooldown(); d2 != 2*base {
-		t.Fatalf("第二次应翻倍为 %s，得 %s", 2*base, d2)
+	got := int64(freeLimitCooldown())
+	if diff := got - want; diff > int64(5*time.Second) || diff < int64(-5*time.Second) {
+		t.Fatalf("冷却应≈到下个重置点 %s，得 %s", time.Duration(want), time.Duration(got))
 	}
-	freeLimitDur.Store(int64(freeLimitDurCap))
-	if d := nextFreeLimitCooldown(); d != freeLimitDurCap {
-		t.Fatalf("应封顶 %s，得 %s", freeLimitDurCap, d)
+	if d := nextFreeLimitCooldown(); d != freeLimitCooldown() {
+		t.Fatalf("再犯不叠加：期望 %s，得 %s", freeLimitCooldown(), d)
+	}
+	if d := nextFreeLimitCooldown(); d != freeLimitCooldown() {
+		t.Fatalf("第三次仍不叠加：得 %s", d)
 	}
 	resetFreeLimitCooldown()
-	if d := nextFreeLimitCooldown(); d != base {
-		t.Fatalf("成功后应回到基础值 %s，得 %s", base, d)
+}
+
+// 窗口重置点：北京 07:59，跨天也成立。
+func TestNextFreeResetSchedule(t *testing.T) {
+	cst := freeResetZone
+	cases := []struct {
+		now  time.Time
+		want time.Time
+	}{
+		{time.Date(2026, 10, 23, 6, 0, 0, 0, cst), time.Date(2026, 10, 23, 7, 59, 0, 0, cst)},
+		{time.Date(2026, 10, 23, 7, 58, 59, 0, cst), time.Date(2026, 10, 23, 7, 59, 0, 0, cst)},
+		{time.Date(2026, 10, 23, 7, 59, 0, 0, cst), time.Date(2026, 10, 24, 7, 59, 0, 0, cst)},
+		{time.Date(2026, 10, 23, 23, 30, 0, 0, cst), time.Date(2026, 10, 24, 7, 59, 0, 0, cst)},
+	}
+	for _, c := range cases {
+		if got := nextFreeReset(c.now); !got.Equal(c.want) {
+			t.Fatalf("%s -> %s，期望 %s", c.now, got, c.want)
+		}
+		if got := lastFreeReset(c.now).AddDate(0, 0, 1); !got.Equal(nextFreeReset(c.now)) {
+			t.Fatalf("lastFreeReset 与 nextFreeReset 不接续：%s <- %s", got, c.now)
+		}
+	}
+}
+
+// 毒名单过窗口重置自动作废：打满的 session 是“今天用完”，第二天解禁。
+func TestPoisonExpiresAtReset(t *testing.T) {
+	resetPoolForTest()
+	defer resetPoolForTest()
+	full := "ses_f88daf257ffeVeQTe3LMg59tzS"
+	if err := os.WriteFile(badSesFilePath(), []byte(full+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badSesLoad()
+	poolMu.Lock()
+	hit := isBadSesLocked(full)
+	// 手动把重置点拨到过去：表应立即作废。
+	poisonResetAt = time.Now().Add(-time.Second)
+	after := isBadSesLocked(full)
+	n := len(badSes)
+	poolMu.Unlock()
+	if !hit {
+		t.Fatal("重置前应判毒")
+	}
+	if after || n != 0 {
+		t.Fatalf("过重置点应整表作废：判毒=%v 条数=%d", after, n)
+	}
+	if _, err := os.Stat(badSesFilePath()); !os.IsNotExist(err) {
+		t.Fatalf("重置后毒名单文件应删除，err=%v", err)
 	}
 }
 

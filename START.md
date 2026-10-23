@@ -39,7 +39,7 @@ bat 顶部 / ps1 `CONFIG` 区：
 | `HIDE_WINDOW` | 1 | 0=显示窗口（排查） |
 | `OPENCODE_ZEN_BASE` | `https://opencode.ai/inference/v1` | 上游 base |
 | `DIRECT_FRESH_PER_TURN` | 1 | 1=每轮换新上游 session；0=一对话一号 |
-| `DIRECT_FREELIMIT_COOLDOWN` | 2700 | 免费额度 429 后的冷却秒数（45 分钟） |
+| `DIRECT_FREELIMIT_COOLDOWN` | 到下个窗口重置 | 免费额度 429 后的冷却秒数（默认封到北京 07:59） |
 
 ## 会话与门禁（v0.7.0+：V2 配方）
 
