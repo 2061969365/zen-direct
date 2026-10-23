@@ -2,19 +2,97 @@ name: live-poison
 
 # 真上游实弹（会消耗免费额度，只在手动触发跑）。
 #
-# 两条 job 必须落在不同 runner 上：各拿一个独立出口 IP。用过一次打满额的
-# session 会把出口 IP 连坐 ≥45 分钟，所以「用毒号」这件事只能放在单独一台
-# 机器上，否则会把验证用的干净 IP 一起拖死。
+# 三段式，因为「用毒号」这件事本身会污染出口 IP（连坐 ≥45 分钟）：
 #
-# armed   ：池子里塞一条真·打满的 session（+ 毒名单同一条），同一对话连打 3 轮，
-#           要求 3 轮全 200、上游看到的 3 条 session 互不相同且都不是那条毒号。
-# control ：另一台 runner，先证明干净 IP 上现签号能 200，再用毒号直打上游，
-#           必须复现 429 FreeUsageLimitError —— 否则 armed 的通过毫无意义。
+#   find-dead ：在 runner A 上逐条试已知的历史死号，直到复现 429 —— 那一台机器
+#               的 IP 就此报废，但拿到了「此刻确实打满」的 id，喂给后面两段。
+#   armed     ：runner B（干净 IP）。把那条死号同时放进池子和毒名单，同一对话
+#               连打 3 轮：必须 3 轮全 200、上游看到 3 条互不相同的号、且没有
+#               一条等于死号。过滤器一坏，第 1 轮就会撞上去 -> 429 -> 立刻失败。
+#   control   ：runner C（另一台干净 IP）。先证明现签号能 200，再用同一条死号
+#               直打上游，必须复现 429 FreeUsageLimitError —— 否则 armed 的
+#               「不是毒号」结论就没有参照物。
 on:
   workflow_dispatch:
 
 jobs:
+  find-dead:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      ses: ${{ steps.probe.outputs.ses }}
+      hits: ${{ steps.probe.outputs.hits }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Build
+        run: go build -trimpath -ldflags '-s -w' -o zen-direct-linux-amd64 .
+
+      - name: Probe the known candidates until one still answers 429
+        id: probe
+        env:
+          CANDIDATES: ${{ secrets.POISON_CANDIDATES }}
+        run: |
+          set -uo pipefail
+          if [ -z "${CANDIDATES:-}" ]; then echo "missing POISON_CANDIDATES secret"; exit 1; fi
+          found=""
+          hits=""
+          i=0
+          while IFS= read -r id; do
+            id="$(echo "$id" | tr -d '[:space:]')"
+            [ -z "$id" ] && continue
+            i=$((i+1))
+            echo "--- candidate #$i"
+            printf '%s\n' "$id" > g.txt
+            rm -f p.txt
+            PORT=18080 \
+            OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1 \
+            SHIM_SESSION_FILE=/tmp/probe-pool.json \
+            GENUINE_SESSION_FILE="$PWD/g.txt" \
+            DIRECT_POISON_FILE="$PWD/p.txt" \
+            LOG_FILE="$PWD/probe.$i.log" \
+            DIRECT_FRESH_PER_TURN=0 \
+            DIRECT_FREELIMIT_COOLDOWN=0 \
+            DIRECT_DEBUG=0 DIRECT_DIAG=0 \
+            nohup ./zen-direct-linux-amd64 > stderr.$i.txt 2>&1 &
+            pid=$!
+            for _ in $(seq 1 30); do
+              sleep 0.5
+              curl -sf -m 2 http://127.0.0.1:18080/health > /dev/null && break
+            done
+            body='{"model":"deepseek-v4.1-flash-free","stream":false,"messages":[{"role":"user","content":"Answer with the single word: ok"}]}'
+            code=$(curl -s -m 120 -o "probe.$i.resp" -w '%{http_code}' \
+              -X POST http://127.0.0.1:18080/v1/chat/completions \
+              -H 'Content-Type: application/json' \
+              -H 'X-Session-Id: probe-fixed' -d "$body")
+            echo "    -> HTTP $code"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            sleep 1
+            if [ "$code" = "429" ]; then
+              found="$id"
+              hits="$i"
+              echo "    cooled/gone: this one is still exhausted"
+              break
+            fi
+            if [ "$code" != "200" ]; then
+              echo "    unexpected status, aborting"
+              break
+            fi
+          done <<< "$CANDIDATES"
+          echo "ses=$found" >> "$GITHUB_OUTPUT"
+          echo "hits=$hits" >> "$GITHUB_OUTPUT"
+          if [ -z "$found" ]; then
+            echo "None of the candidates returns 429 any more: either they recovered"
+            echo "or those 429s were egress-IP taint rather than session exhaustion."
+            echo "Nothing to arm with - refusing to claim a poison test."
+            exit 1
+          fi
+
   armed:
+    needs: find-dead
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -25,15 +103,15 @@ jobs:
       - name: Build
         run: go build -trimpath -ldflags '-s -w' -o zen-direct-linux-amd64 .
 
-      - name: Seed the pool with a genuinely exhausted session
+      - name: Seed the pool with the freshly verified dead session
         env:
-          POISON_SES: ${{ secrets.POISON_SES }}
+          DEAD: ${{ needs.find-dead.outputs.ses }}
         run: |
           set -euo pipefail
-          if [ -z "${POISON_SES:-}" ]; then echo "missing POISON_SES secret"; exit 1; fi
-          printf '%s\n' "$POISON_SES" > genuine.txt   # 池里只有这条毒号
-          printf '%s\n' "$POISON_SES" > poison.txt    # 毒名单也认它
-          echo "genuine=$(wc -l < genuine.txt) poison=$(wc -l < poison.txt)"
+          echo "candidate #${{ needs.find-dead.outputs.hits }} produced the 429"
+          printf '%s\n' "$DEAD" > genuine.txt   # 池里只有这条死号
+          printf '%s\n' "$DEAD" > poison.txt    # 毒名单也认它
+          echo "genuine=$(wc -l < genuine.txt) poison=$(wc -l < poison.txt) len=$(head -1 poison.txt | wc -c)"
 
       - name: Start gateway against the real upstream
         run: |
@@ -49,7 +127,7 @@ jobs:
           DIRECT_DIAG=1 \
           nohup ./zen-direct-linux-amd64 > stderr.txt 2>&1 &
           echo $! > gw.pid
-          for i in $(seq 1 40); do
+          for _ in $(seq 1 40); do
             sleep 1
             if curl -sf -m 3 http://127.0.0.1:18080/health > health.json; then
               echo "health: $(cat health.json)"
@@ -78,36 +156,38 @@ jobs:
             fi
           done
 
-      - name: Assert fresh id per turn and no poisoned id
+      - name: Assert fresh id per turn and no dead id on the wire
         env:
-          POISON_SES: ${{ secrets.POISON_SES }}
+          DEAD: ${{ needs.find-dead.outputs.ses }}
         run: |
           set -euo pipefail
           grep -o 'ses=[A-Za-z0-9_]*' gw.log | sed 's/^ses=//' | grep -v '^$' | sort -u > used.txt || true
           echo "--- upstream sessions the gateway used ---"
-          cat used.txt
+          sed -E 's/(ses_.{6}).*/\1…/' used.txt
           n=$(wc -l < used.txt | tr -d ' ')
           if [ "$n" -ne 3 ]; then
-            echo "expected 3 distinct sessions for 3 turns, got $n"
+            echo "FAIL: expected 3 distinct sessions for 3 turns, got $n"
             exit 1
           fi
-          if grep -qx "$POISON_SES" used.txt; then
-            echo "FAIL: the poisoned session was put on the wire"
+          if grep -qx "$DEAD" used.txt; then
+            echo "FAIL: the exhausted session was put on the wire"
             exit 1
           fi
           if grep -q 'free-usage 429' gw.log; then
             echo "FAIL: a free-limit 429 happened during the run"
             exit 1
           fi
-          echo "PASS: 3 turns, 3 distinct fresh sessions, poisoned id never used"
+          echo "PASS: 3 turns, 3 distinct fresh sessions, exhausted id never used"
 
       - name: Logs
         if: always()
         run: |
-          echo "--- gateway log ---"; tail -60 gw.log || true
+          echo "--- gateway log (ids masked) ---"
+          sed -E 's/(ses_.{6})[A-Za-z0-9_]+/\1…/g' gw.log 2>/dev/null | tail -40 || true
           echo "--- stderr ---"; tail -20 stderr.txt || true
 
   control:
+    needs: find-dead
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -131,7 +211,7 @@ jobs:
           DIRECT_FREELIMIT_COOLDOWN=0 \
           nohup ./zen-direct-linux-amd64 > stderr1.txt 2>&1 &
           echo $! > gw1.pid
-          for i in $(seq 1 40); do
+          for _ in $(seq 1 40); do
             sleep 1
             if curl -sf -m 3 http://127.0.0.1:18081/health > /dev/null; then break; fi
           done
@@ -140,7 +220,7 @@ jobs:
             -X POST http://127.0.0.1:18081/v1/chat/completions \
             -H 'Content-Type: application/json' \
             -H 'X-Session-Id: ci-control-fresh' -d "$body")
-          echo "fresh -> HTTP $code"; head -c 300 resp_fresh; echo
+          echo "fresh -> HTTP $code"; head -c 200 resp_fresh; echo
           kill "$(cat gw1.pid)" 2>/dev/null || true
           if [ "$code" != "200" ]; then
             echo "FAIL: a freshly minted session did not work from this runner"
@@ -148,13 +228,12 @@ jobs:
             exit 1
           fi
 
-      - name: The poisoned id still answers 429 today
+      - name: The dead id still answers 429 from another IP
         env:
-          POISON_SES: ${{ secrets.POISON_SES }}
+          DEAD: ${{ needs.find-dead.outputs.ses }}
         run: |
           set -euo pipefail
-          if [ -z "${POISON_SES:-}" ]; then echo "missing POISON_SES secret"; exit 1; fi
-          printf '%s\n' "$POISON_SES" > genuine2.txt
+          printf '%s\n' "$DEAD" > genuine2.txt
           rm -f /tmp/c2-poison.txt
           PORT=18082 \
           OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1 \
@@ -162,10 +241,11 @@ jobs:
           GENUINE_SESSION_FILE="$PWD/genuine2.txt" \
           DIRECT_POISON_FILE=/tmp/c2-poison.txt \
           LOG_FILE="$PWD/gw2.log" \
+          DIRECT_FRESH_PER_TURN=0 \
           DIRECT_FREELIMIT_COOLDOWN=0 \
           nohup ./zen-direct-linux-amd64 > stderr2.txt 2>&1 &
           echo $! > gw2.pid
-          for i in $(seq 1 40); do
+          for _ in $(seq 1 40); do
             sleep 1
             if curl -sf -m 3 http://127.0.0.1:18082/health > /dev/null; then break; fi
           done
@@ -174,11 +254,11 @@ jobs:
             -X POST http://127.0.0.1:18082/v1/chat/completions \
             -H 'Content-Type: application/json' \
             -H 'X-Session-Id: ci-control-poison' -d "$body")
-          echo "poisoned -> HTTP $code"; head -c 300 resp_poison; echo
+          echo "dead id -> HTTP $code"; head -c 300 resp_poison; echo
           kill "$(cat gw2.pid)" 2>/dev/null || true
           if [ "$code" != "429" ]; then
-            echo "FAIL: the id is no longer exhausted (stale POISON_SES?) - 'armed' proved nothing"
-            tail -40 gw2.log || true
+            echo "FAIL: the id does not 429 from a second IP either - the earlier"
+            echo "      probe result was probably egress-IP taint, not exhaustion."
             exit 1
           fi
           if ! grep -q 'FreeUsageLimitError' resp_poison; then
@@ -186,10 +266,10 @@ jobs:
             cat resp_poison
             exit 1
           fi
-          echo "PASS: poisoned id is genuinely dead today"
+          echo "PASS: the exhausted id reproduces 429 from an unrelated IP"
 
       - name: Logs
         if: always()
         run: |
-          echo "--- gw1 ---"; tail -30 gw1.log 2>/dev/null || true
-          echo "--- gw2 ---"; tail -30 gw2.log 2>/dev/null || true
+          echo "--- gw1 ---"; sed -E 's/(ses_.{6})[A-Za-z0-9_]+/\1…/g' gw1.log 2>/dev/null | tail -20 || true
+          echo "--- gw2 ---"; sed -E 's/(ses_.{6})[A-Za-z0-9_]+/\1…/g' gw2.log 2>/dev/null | tail -20 || true
