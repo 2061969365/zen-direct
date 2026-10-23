@@ -39,7 +39,7 @@ bat 顶部 / ps1 `CONFIG` 区：
 | `HIDE_WINDOW` | 1 | 0=显示窗口（排查） |
 | `OPENCODE_ZEN_BASE` | `https://opencode.ai/inference/v1` | 上游 base |
 | `DIRECT_FRESH_PER_TURN` | 0（启动器）/ 1（代码） | 1=每轮换新上游 session；0=一对话一号（撞 429 才换） |
-| `DIRECT_FREELIMIT_COOLDOWN` | 到下个窗口重置 | 免费额度 429 后的冷却秒数（默认封到北京 07:59） |
+| `DIRECT_FREELIMIT_COOLDOWN` | 0（默认关） | 免费额度 429 后的冷却秒数；轮换代理下默认不冷却 |
 
 ## 会话与门禁（v0.7.0+：V2 配方）
 
@@ -76,12 +76,25 @@ bat 顶部 / ps1 `CONFIG` 区：
 窗口重置清表之前，当天那批号会先追加进 `poison_archive.txt`（带
 `# window ended …` 日期头），日志留 7 天但归档常驻，每天毒了哪些号可查。
 默认**一对话一号**（启动器 `$FreshPerTurn = '0'`，代码默认 `1`）：吃到 429 时
-记毒 + 换号并封到下一个 07:59（换出口 IP 立即解封），不做当次重试；429 日志里
-带 `turns=N`（这条号在本次窗口内已经成功服务了几轮），用来量真实额度。
+记毒 + 换号，不做当次重试；429 日志里带 `turns=N`（这条号在本次窗口内已经成功
+服务了几轮），用来量真实额度。
 
-429 兜底：认得出 `FreeUsageLimitError` → 记毒 + 全天冷却；明确是限流
+**会话键（`fp`）**：下游自带 `X-Session-Id`/`x-session-affinity` 就用它；没有头
+就取**第一条 user 消息**（+ instructions/system 作盐）。绝不能取 `messages[0]`
+——chat 客户端第一条几乎总是 system 提示词，那样所有对话会算成同一个 fp。
+实测（2026-10-23 夜）：DSH 的 262 个请求只落成 **2 个 fp**，等于所有“新会话”
+共用同一条上游 session，一条打满就全体 429；opencode 自带 `X-Session-Id`，
+所以它一直正常。改成首条 user 消息后立刻一会话一条 session。
+
+**冷却默认关闭**：429 有两个来源——session 打满、出口 IP 被连坐。后者与“此刻
+这条线路”绑定，而轮换代理每条连接换 IP，网关探到的 IP 和实际出流 IP 不是同一
+条连接。封到 07:59 只会让新会话第一发被本地短路（实测 00:06–00:09 DSH 全灭，
+一秒后换 IP 的请求 200）。默认不冷却后每个请求各自去试，该记毒照样记毒；
+需要时可 `DIRECT_FREELIMIT_COOLDOWN=<秒>` 显式打开。
+
+429 兜底：认得出 `FreeUsageLimitError` → 记毒（换号）；明确是限流
 （`too many requests` / `rate limit`）→ 原样透传，不记毒；**认不出类型** →
-记毒 + 换号但不封全天（上游改措辞时不再赌）。
+记毒 + 换号但不进冷却（上游改措辞时不再赌）。
 
 旧注：此前误判为“白名单登记制”；实测证明纯结构判定（低 12 位），
 本地 descending 现签与本体无异。service/harvest/ACP 链保留作冗余，

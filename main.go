@@ -310,8 +310,9 @@ func normalizeModel(in map[string]any) {
 
 func isOfficialUA(ua string) bool { return strings.HasPrefix(ua, "opencode/") }
 
-// fpForEntry 下游会话键：X-Session-Id 头优先；无头按入口格式取首文本+instructions/system。
-// keyed=false 表示无法定键（空体/首条非文本）：调用方不得进池（防多会话同键
+// fpForEntry 下游会话键：X-Session-Id 头优先；无头按入口格式取“第一条 user 消息”
+// + instructions/system 作为盐。
+// keyed=false 表示无法定键（空体/没有正文）：调用方不得进池（防多会话同键
 // 串 caller），走“每请求现签 + 首见剥离”安全默认。
 func fpForEntry(entry Format, h http.Header, in map[string]any) (string, bool) {
 	if sid := strings.TrimSpace(h.Get("X-Session-Id")); sid != "" {
@@ -322,22 +323,63 @@ func fpForEntry(entry Format, h http.Header, in map[string]any) (string, bool) {
 	}
 	ins, _ := in["instructions"].(string)
 	sys, _ := in["system"].(string)
-	first := ""
-	items, _ := in["input"].([]any)
-	msgs, _ := in["messages"].([]any)
-	if entry == FmtChat && len(msgs) > 0 {
-		if m, ok := msgs[0].(map[string]any); ok {
-			first = textOfContent(m["content"])
-		}
-	} else if len(items) > 0 {
-		if m, ok := items[0].(map[string]any); ok {
-			first = textOfContent(m["content"])
-		}
+	var list []any
+	if entry == FmtChat {
+		list, _ = in["messages"].([]any)
+	} else {
+		list, _ = in["input"].([]any)
 	}
+	first, salt := conversationSeed(list)
 	if strings.TrimSpace(first) == "" {
 		return "", false
 	}
-	return fpKey("", first, ins+sys), true
+	return fpKey("", first, ins+sys+salt), true
+}
+
+// conversationSeed 从消息列表里挑出「同一对话稳定、不同对话不同」的指纹。
+//
+// 取第一条 user 消息：对话续聊时 history 只往后接，这条永远不变；不同对话的
+// 开场白通常也不同。system/developer 提示词单独作为盐，避免把同一个 agent 的
+// 不同对话混成一条。
+//
+// 绝不能直接拿 messages[0]：chat 客户端第一条几乎总是 system 提示词，所有对话
+// 会算出同一个 fp。实测 2026-10-23 夜间 DSH 的 256 个请求只落成 2 个 fp，
+// 等于所有“新会话”共用同一条上游 session —— 一条打满，全体新会话 429。
+func conversationSeed(list []any) (first, salt string) {
+	fallback := ""
+	for _, raw := range list {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		txt := strings.TrimSpace(textOfContent(m["content"]))
+		if txt == "" {
+			continue
+		}
+		role, _ := m["role"].(string)
+		switch role {
+		case "system", "developer":
+			if len(salt) < 8<<10 {
+				salt += "\x00" + txt
+			}
+			if fallback == "" {
+				fallback = txt
+			}
+		case "user":
+			if first == "" {
+				first = txt
+				return first, salt // 系统提示一般在前面，找到首条 user 即可收工
+			}
+		default:
+			if fallback == "" {
+				fallback = txt
+			}
+		}
+	}
+	if first == "" {
+		first = fallback
+	}
+	return first, salt
 }
 
 // isCallerMismatch 上游 400 是否“签发 caller 不一致”（毒串回放）。
@@ -405,24 +447,27 @@ func lastFreeReset(now time.Time) time.Time {
 	return nextFreeReset(now).AddDate(0, 0, -1)
 }
 
-// freeLimitCooldown 冷却时长：默认封到下一次窗口重置（北京 07:59）。
-// 换出口 IP 会立刻解除冷却（见 freeLimitIP），手动切线路不受此限。
-// DIRECT_FREELIMIT_COOLDOWN 秒可调（0=不冷却，测试/探针用）。
+// freeLimitCooldown 冷却时长：默认 0（不冷却）。
+//
+// 为什么默认关掉：429 至少有两个来源——session 额度用尽，和出口 IP 被连坐。
+// 后者跟“这条线路此刻能不能用”绑定，而轮换代理每条连接换一个 IP，网关探到的
+// IP 与实际发请求用的 IP 根本不是同一条连接。于是冷却变成“一 429 就封到 07:59，
+// 探到 IP 变了再解封”的抖动：新会话第一发撞在冷却窗口里就被本地短路（实测
+// 2026-10-24 00:06–00:09，DSH 开新会话全部 429，而同一时刻下一个请求却 200）。
+//
+// 默认不冷却后，每个请求各自去试：坏 IP 的那一发回 429（原样透传），下一次换
+// 条线路大概率就通了。session 该记毒照样记毒，安全网还在。
+// DIRECT_FREELIMIT_COOLDOWN=<秒> 可显式打开冷却（0 即现在的默认）。
 func freeLimitCooldown() time.Duration {
 	if v := os.Getenv("DIRECT_FREELIMIT_COOLDOWN"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			return time.Duration(n) * time.Second
 		}
 	}
-	if d := time.Until(nextFreeReset(time.Now())); d > 0 {
-		return d
-	}
-	return time.Minute
+	return 0
 }
 
-// nextFreeLimitCooldown 下一次 429 的冷却：同样封到窗口重置，不叠加翻倍。
-// 冷却期内请求走本地短路，根本打不到上游；还能再吃到 429 只可能是换了出口
-// IP，而新 IP 也在连坐期，封到同一个重置点即可。
+// nextFreeLimitCooldown 下一次 429 的冷却（默认 0，见 freeLimitCooldown）。
 func nextFreeLimitCooldown() time.Duration {
 	cd := freeLimitCooldown()
 	freeLimitDur.Store(int64(cd))

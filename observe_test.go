@@ -110,6 +110,89 @@ func TestUnknown429PoisonsSession(t *testing.T) {
 	}
 }
 
+// 同一个 system 提示词、不同开场白 = 不同对话：fp 必须不同。
+// 老实现取 messages[0]（system），DSH 的 256 个请求只落成 2 个 fp，等于所有
+// “新会话”共用一条上游 session。
+func TestFpSeparatesConversations(t *testing.T) {
+	const sysPrompt = "You are an AI agent powered by Test Harness."
+	mk := func(user string) map[string]any {
+		return map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": sysPrompt},
+			map[string]any{"role": "user", "content": user},
+		}}
+	}
+	a, okA := fpForEntry(FmtChat, http.Header{}, mk("first prompt A"))
+	b, okB := fpForEntry(FmtChat, http.Header{}, mk("first prompt B"))
+	if !okA || !okB {
+		t.Fatal("两条对话都应能定键")
+	}
+	if a == b {
+		t.Fatalf("不同开场白不应共用 fp：%s", a)
+	}
+
+	// 续聊：历史只往后接，fp 必须保持稳定。
+	growth := map[string]any{"messages": []any{
+		map[string]any{"role": "system", "content": sysPrompt},
+		map[string]any{"role": "user", "content": "first prompt A"},
+		map[string]any{"role": "assistant", "content": "ok"},
+		map[string]any{"role": "user", "content": "second turn"},
+	}}
+	c, _ := fpForEntry(FmtChat, http.Header{}, growth)
+	if c != a {
+		t.Fatalf("同一对话续聊 fp 应稳定：%s != %s", c, a)
+	}
+
+	// 完全没有 user 消息时退回首条正文（不能返回“无键”让调用方现签）。
+	onlySys := map[string]any{"messages": []any{
+		map[string]any{"role": "system", "content": sysPrompt},
+	}}
+	if _, ok := fpForEntry(FmtChat, http.Header{}, onlySys); !ok {
+		t.Fatal("只有 system 时也应能定键（退回首条正文）")
+	}
+}
+
+// 无 X-Session-Id 的 chat 客户端：两个不同对话必须落到两条不同的上游 session。
+func TestPoolSeparatesConversations(t *testing.T) {
+	resetPoolForTest()
+	defer resetPoolForTest()
+	t.Setenv("DIRECT_FRESH_PER_TURN", "0")
+	var mu sync.Mutex
+	var sessions []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		sessions = append(sessions, r.Header.Get("X-Opencode-Session"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w,
+			"data: {\"id\":\"c1\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"+
+				"data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	old := upstream
+	upstream = mustParseURL(t, srv.URL)
+	defer func() { upstream = old }()
+
+	body := func(user string) string {
+		return `{"model":"mimo-v2.5-free","stream":false,"messages":[` +
+			`{"role":"system","content":"same system prompt"},` +
+			`{"role":"user","content":"` + user + `"}]}`
+	}
+	if code, b := postChat(t, "http://x", body("conversation A")); code != 200 {
+		t.Fatalf("A 应 200：%d %.200s", code, b)
+	}
+	if code, b := postChat(t, "http://x", body("conversation B")); code != 200 {
+		t.Fatalf("B 应 200：%d %.200s", code, b)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sessions) != 2 {
+		t.Fatalf("上游应被调 2 次，得 %d", len(sessions))
+	}
+	if sessions[0] == sessions[1] {
+		t.Fatalf("两个不同对话共用了一条上游 session：%s", sessions[0])
+	}
+}
+
 // 窗口重置：先把当天毒号归档，再清表删文件。
 func TestPoisonArchiveOnReset(t *testing.T) {
 	resetPoolForTest()

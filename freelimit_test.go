@@ -24,6 +24,7 @@ const freeLimitBody = `{"type":"error","error":{"type":"FreeUsageLimitError","me
 // 免费额度 429：原样回给客户端、不重试、记毒、并把池里的 session 换掉。
 func TestFreeUsageLimitPoisonsAndRotates(t *testing.T) {
 	resetPoolForTest()
+	t.Setenv("DIRECT_FREELIMIT_COOLDOWN", "600") // 本条验冷却行为；默认已不冷却
 	freeLimitUntil.Store(0)
 	var mu sync.Mutex
 	var sessions []string
@@ -115,25 +116,22 @@ func TestFreeLimitCooldownShortCircuits(t *testing.T) {
 	}
 }
 
-// 冷却时长：封到下一次窗口重置（北京 07:59），不翻倍、不封顶——额度是日窗口，
-// 短冷却只会拿新 session 去撞墙。
-func TestFreeLimitCooldownUntilReset(t *testing.T) {
+// 冷却默认关闭：轮换代理下“封到 07:59”只会把新会话挡在门外（2026-10-24 00:06
+// 实测 DSH 新会话连续 429，而下一秒换 IP 的请求 200）。显式设置才启用。
+func TestFreeLimitCooldownDefaultsOff(t *testing.T) {
 	resetPoolForTest()
-	now := time.Now()
-	want := int64(time.Until(nextFreeReset(now)))
-	if want <= 0 {
-		t.Fatalf("到下个重置点应为正时长，得 %s", time.Duration(want))
+	if d := freeLimitCooldown(); d != 0 {
+		t.Fatalf("默认应不冷却，得 %s", d)
 	}
-	got := int64(freeLimitCooldown())
-	if diff := got - want; diff > int64(5*time.Second) || diff < int64(-5*time.Second) {
-		t.Fatalf("冷却应≈到下个重置点 %s，得 %s", time.Duration(want), time.Duration(got))
+	if d := nextFreeLimitCooldown(); d != 0 {
+		t.Fatalf("默认 next 也应为 0，得 %s", d)
 	}
-	// 再犯不叠加：每次都是「到同一个重置点」，允许几秒抖动（两次 time.Now 不同）。
-	for i := 0; i < 2; i++ {
-		d := nextFreeLimitCooldown()
-		if diff := int64(d) - want; diff > int64(5*time.Second) || diff < int64(-5*time.Second) {
-			t.Fatalf("第 %d 次再犯仍应≈到下个重置点 %s，得 %s", i+2, time.Duration(want), d)
-		}
+	t.Setenv("DIRECT_FREELIMIT_COOLDOWN", "120")
+	if d := freeLimitCooldown(); d != 120*time.Second {
+		t.Fatalf("显式设置应生效，得 %s", d)
+	}
+	if d := nextFreeLimitCooldown(); d != 120*time.Second {
+		t.Fatalf("next 应沿用显式值，得 %s", d)
 	}
 	resetFreeLimitCooldown()
 }
