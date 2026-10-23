@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -363,6 +364,64 @@ func poolBorrowEx(fp string) (string, bool) {
 		e.Session = ses
 		e.Gen = gen
 		e.LastSeen = time.Now()
+	} else {
+		poolMap[fp] = &poolEntry{Session: ses, LastSeen: time.Now(), Gen: gen}
+		poolQ = append(poolQ, fp)
+		if len(poolQ) > poolCap {
+			delete(poolMap, poolQ[0])
+			poolQ = poolQ[1:]
+		}
+	}
+	poolDirty = true
+	poolMu.Unlock()
+	poolSaveAsync()
+	return ses, true
+}
+
+// freshPerTurn 每轮换号，默认开：一个对话的每一轮都用一条本轮没用过的上游
+// session。DIRECT_FRESH_PER_TURN=0 退回“一对话一号”。
+//
+// 依据（实测，见 zen-remote-probe/FINDINGS.md）：额度按上游 session 计，一条
+// session 打满就一直 429 到窗口重置；而碰一次打满的 session 会让出口 IP 连坐
+// ≥45 分钟。于是“对话钉住一条号”最致命的场景是长对话聊到第 N 轮撞板——不但
+// 这一轮失败，后面 45 分钟整个网关都 429。改成每轮换新号后，发出去的号最多
+// 只承担该对话的一轮，撞板概率≈0；老对话也不会因为存着一条死号而一开口就炸。
+//
+// 代价：每轮都是新 lineage，responses 表单里的 reasoning 串一律剥离（本来
+// 首见也要剥），session 级 prompt cache 可能少一些。
+func freshPerTurn() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DIRECT_FRESH_PER_TURN"))) {
+	case "0", "false", "no", "off":
+		return false
+	}
+	return true
+}
+
+// rotateSeq 全局换号游标：每轮 +1，让连续请求落在池里不同的号上；同一对话
+// 的相邻两轮也不会撞同一个号（除非池子正好转了一圈）。
+var rotateSeq atomic.Uint64
+
+// poolNextSes 自愿换新号：与 poolRotate 的区别是**不把旧号记毒**——旧号是好的，
+// 只是这一轮不再用它。顺序同 borrow：service 现铸 → 收割名单 → ACP → 本地现签。
+func poolNextSes(fp string) (string, bool) {
+	if fp == "" {
+		return poolBorrowEx(fp)
+	}
+	ses, gen := "", false
+	if s := svcMintFunc(); s != "" {
+		ses, gen = s, true
+	} else if s := pickGenuine(fp, rotateSeq.Add(1)); s != "" {
+		ses, gen = s, true
+	} else if s := acpMintFunc(); s != "" {
+		ses, gen = s, true
+	} else {
+		ses = mintID("ses")
+	}
+	poolMu.Lock()
+	if old, ok := poolMap[fp]; ok {
+		old.Session = ses
+		old.Gen = gen
+		old.LastSeen = time.Now()
 	} else {
 		poolMap[fp] = &poolEntry{Session: ses, LastSeen: time.Now(), Gen: gen}
 		poolQ = append(poolQ, fp)

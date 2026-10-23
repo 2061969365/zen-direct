@@ -723,7 +723,12 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		fp, keyed = fpForEntry(entry, req.Header, in)
 		if keyed {
 			usePool = true
-			poolSes, isNewFP = poolBorrowEx(fp)
+			if freshPerTurn() {
+				// 每轮新号：老对话存着的号一律不用，从源头避免“一开口就撞死号”。
+				poolSes, isNewFP = poolNextSes(fp)
+			} else {
+				poolSes, isNewFP = poolBorrowEx(fp)
+			}
 		} else {
 			// 无键=无法定 lineage，按首见处理（剥离开），但不入库。
 			isNewFP = true

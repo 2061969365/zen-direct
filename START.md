@@ -37,7 +37,9 @@ bat 顶部 / ps1 `CONFIG` 区：
 | `LOG_MAX_MB` | 200 | 日志总量硬顶 |
 | `LOG_KEEP_DAYS` | 7 | 过期日志自动删 |
 | `HIDE_WINDOW` | 1 | 0=显示窗口（排查） |
-| `OPENCODE_ZEN_BASE` | `https://opencode.ai/zen/v1` | 上游 base |
+| `OPENCODE_ZEN_BASE` | `https://opencode.ai/inference/v1` | 上游 base |
+| `DIRECT_FRESH_PER_TURN` | 1 | 1=每轮换新上游 session；0=一对话一号 |
+| `DIRECT_FREELIMIT_COOLDOWN` | 2700 | 免费额度 429 后的冷却秒数（45 分钟） |
 
 ## 会话与门禁（v0.7.0+：V2 配方）
 

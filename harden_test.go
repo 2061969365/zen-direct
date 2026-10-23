@@ -257,7 +257,9 @@ func TestDoneQuotedMarkers(t *testing.T) {
 }
 
 // caller-mismatch 自愈：池命中+毒历史 -> 首轮 400 -> 轮换+剥离重发 -> 客户端 200。
+// 本用例刻意跑“一对话一号”模式：只有复用时首轮才不剥 blob，才轮到 400 自愈。
 func TestCallerMismatchSelfHeal(t *testing.T) {
+	t.Setenv("DIRECT_FRESH_PER_TURN", "0") // 每轮换号会在发请求前剥离，见 TestFreshPerTurnRotates
 	resetPoolForTest()
 	var mu sync.Mutex
 	var bodies, sessions []string
@@ -691,6 +693,7 @@ func TestCircuitBreaker(t *testing.T) {
 }
 
 func TestFailedTurnEvictsNewSession(t *testing.T) {
+	t.Setenv("DIRECT_FRESH_PER_TURN", "0") // 测“一对话一号”的 lineage 保持语义
 	defer cbReset()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(500)

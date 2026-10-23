@@ -221,3 +221,54 @@ func TestPoolPersistReload(t *testing.T) {
 		t.Fatalf("reload 应恢复 %q，得 %q", ses, got)
 	}
 }
+
+// 每轮换号：同一对话连续两轮必须落到不同上游 session，且换下来的旧号
+// 不得记毒（旧号是好的，只是这一轮不再用）。
+func TestFreshPerTurnRotates(t *testing.T) {
+	resetPoolForTest()
+	defer resetPoolForTest()
+	t.Setenv("DIRECT_FRESH_PER_TURN", "1")
+	genuineSessions = []string{
+		"ses_aaaa0001ffeaaaaaaaaaaaaaa1",
+		"ses_aaaa0001ffeaaaaaaaaaaaaaa2",
+		"ses_aaaa0001ffeaaaaaaaaaaaaaa3",
+		"ses_aaaa0001ffeaaaaaaaaaaaaaa4",
+	}
+	genuineSet = map[string]bool{}
+	for _, s := range genuineSessions {
+		genuineSet[s] = true
+	}
+	first, isNew := poolNextSes("fp:rotate")
+	if !isNew || first == "" {
+		t.Fatalf("换号应报首见且有值，得 %q new=%v", first, isNew)
+	}
+	second, _ := poolNextSes("fp:rotate")
+	if second == "" || second == first {
+		t.Fatalf("相邻两轮应用不同 session：%q -> %q", first, second)
+	}
+	if got := poolLookup("fp:rotate"); got != second {
+		t.Fatalf("映射应更新到 %q，得 %q", second, got)
+	}
+	poolMu.Lock()
+	n, poisoned := len(badSes), badSes[first] || badSes[second]
+	poolMu.Unlock()
+	if poisoned || n != 0 {
+		t.Fatalf("自愿换号不得记毒：%d 条，first/second 命中=%v", n, poisoned)
+	}
+}
+
+// DIRECT_FRESH_PER_TURN 解析：默认开，显式 0/false/off 才关。
+func TestFreshPerTurnSwitch(t *testing.T) {
+	for _, v := range []string{"0", "false", "off", "NO"} {
+		t.Setenv("DIRECT_FRESH_PER_TURN", v)
+		if freshPerTurn() {
+			t.Fatalf("%q 应关闭每轮换号", v)
+		}
+	}
+	for _, v := range []string{"1", "true", "", "yes"} {
+		t.Setenv("DIRECT_FRESH_PER_TURN", v)
+		if !freshPerTurn() {
+			t.Fatalf("%q 应开启每轮换号", v)
+		}
+	}
+}
