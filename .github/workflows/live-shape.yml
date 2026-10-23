@@ -1,0 +1,99 @@
+name: live-shape
+
+# 云端实测：在 GitHub runner 的干净出口 IP 上跑 zen-direct 本体，按 DSH 的形状
+# （不带 X-Session-Id 头，只有 system + user）发三段对话：
+#   A1、B1 不同开场白 → 必须是两个 fp、两条上游 session；
+#   A2 续聊（history 追加） → fp 必须稳定、复用 A 的 session。
+# 云端 IP 全新，所以 429 turns=0 只能说明网关请求形状有问题，不能赖本地 IP 中毒。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: build
+        run: go build -trimpath -o zen-direct .
+      - name: egress IP
+        run: curl -s -m 15 http://ip-api.com/json | head -c 200; echo
+      - name: gateway + three DSH-shaped conversations
+        run: |
+          set -u
+          W="$PWD/_live"; mkdir -p "$W"
+          : > "$W/genuine.txt"
+
+          PORT=18081 \
+          OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1 \
+          DIRECT_FRESH_PER_TURN=0 \
+          DIRECT_DEBUG=1 \
+          DIRECT_DIAG=1 \
+          LOG_FILE="$W/gw.log" \
+          SHIM_SESSION_FILE="$W/shim.json" \
+          DIRECT_POISON_FILE="$W/poison.txt" \
+          GENUINE_SESSION_FILE="$W/genuine.txt" \
+          ./zen-direct >"$W/stderr.log" 2>&1 &
+          GW=$!
+
+          for i in $(seq 1 60); do
+            curl -sf -m 2 http://127.0.0.1:18081/health >/dev/null 2>&1 && break
+            sleep 0.3
+          done
+          echo "health: $(curl -s -m 5 http://127.0.0.1:18081/health)"
+
+          python3 - <<'EOF' | tee "$W/requests.txt"
+          import json, random, time, urllib.request, urllib.error
+
+          def post(tag, messages):
+              body = json.dumps({"model": "deepseek-v4.1-flash-free",
+                                 "stream": False,
+                                 "messages": messages}).encode()
+              req = urllib.request.Request(
+                  "http://127.0.0.1:18081/v1/chat/completions",
+                  data=body, method="POST")
+              req.add_header("Content-Type", "application/json")
+              t0 = time.time()
+              try:
+                  with urllib.request.urlopen(req, timeout=120) as r:
+                      print("%s -> %s %.1fs %r" % (tag, r.status, time.time()-t0,
+                                                   r.read(120)[:120]))
+              except urllib.error.HTTPError as e:
+                  print("%s -> %s %.1fs %r retry-after=%s" % (
+                      tag, e.code, time.time()-t0, e.read(300)[:300],
+                      e.headers.get("Retry-After")))
+              except Exception as e:
+                  print("%s -> ERR %s" % (tag, e))
+
+          sysmsg = "You are an AI agent powered by DeepSeek Harness. Test run."
+          run = str(random.randrange(10**9))
+          a1 = [{"role": "system", "content": sysmsg},
+                {"role": "user", "content": "cloud alpha " + run}]
+          b1 = [{"role": "system", "content": sysmsg},
+                {"role": "user", "content": "cloud beta " + run}]
+          a2 = a1 + [{"role": "assistant", "content": "ok"},
+                     {"role": "user", "content": "follow up"}]
+
+          post("A1 (no session header)", a1)
+          time.sleep(2)
+          post("B1 (no session header)", b1)
+          time.sleep(2)
+          post("A2 (same conversation as A1)", a2)
+          EOF
+
+          sleep 1
+          echo "=== gateway log (fp/ses/429) ==="
+          grep -E '\[REQ|free-usage|session policy' "$W/gw.log" \
+            | sed -E 's/ debug upBody.*//' | tail -40
+          echo "=== stderr ==="
+          tail -20 "$W/stderr.log"
+          kill "$GW" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-shape-logs
+          path: _live
