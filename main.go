@@ -25,7 +25,14 @@ import (
 	"time"
 )
 
-const zenUA = "opencode/latest/2.0.29/cli"
+// zenUA 上游 UA。DIRECT_UA 可覆盖（用来验证上游是否按客户端版本分额度桶）。
+// 2.0.29 是当初抓包时的版本；本机 CLI 已是 2.1.2。
+var zenUA = func() string {
+	if v := os.Getenv("DIRECT_UA"); v != "" {
+		return v
+	}
+	return "opencode/latest/2.0.29/cli"
+}()
 const mintChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 const mintHex = "0123456789abcdef"
 
