@@ -31,9 +31,18 @@ var (
 	// 名单仅作无 service/无 ACP 环境的兜底。
 	genuineSessions []string
 	genuineSet       = map[string]bool{}
-	// badSes 401/403 下烧掉的 session（内存态，重启清空；上限防 403 风暴无界涨）。
+	// badSes 401/403/免费额度烧掉的 session（落盘名单，重启由 badSesLoad 恢复；
+	// 上限防 403 风暴无界涨）。
 	badSes = map[string]bool{}
+	// badSesPrefix 前缀命中表：名单里可能抄进被日志截断的短 id（如 ses_ + 16 位），
+	// 精确查表永远放不中，等于把已打满的 session 又原样发回去——2026-10-23 事故：
+	// 6 条截断条目全失效，干净出口 IP 一接就被连坐。故短条目按前缀匹配，宁严勿漏。
+	badSesPrefix []string
 )
+
+// sesIDLen 现网上游 session id 定长（ses_ 4 位 + 26 位）。短于此的名单条目
+// 只可能是日志截断的残条（网关 429 日志曾用 shortStr(ses,20)）。
+const sesIDLen = 30
 
 // badSesCap 烧号表上限：超了整表清零（误烧的 transient 迟早恢复，白名单重学）。
 const badSesCap = 2048
@@ -72,14 +81,50 @@ func badSesLoad() {
 		if s == "" || strings.HasPrefix(s, "#") {
 			continue
 		}
-		if !badSes[s] {
-			badSes[s] = true
+		if len(s) < 10 {
+			log.Printf("[pool] poison entry %q too short, ignored", s)
+			continue
+		}
+		if badSesAddLocked(s) {
 			n++
+		}
+		if len(s) < sesIDLen {
+			// 残条：精确匹配废掉，只能靠前缀兜。出现这条日志就说明有抄错的名单，
+			// 该换成完整 id（网关 429 日志已改打全长 id）。
+			log.Printf("[pool] poison entry %s truncated (%d<%d), prefix-match enabled", s, len(s), sesIDLen)
 		}
 	}
 	if n > 0 {
 		log.Printf("[pool] loaded %d poisoned sessions from %s", n, path)
 	}
+}
+
+// badSesAddLocked 记一条毒名单（精确表 + 前缀表）。已在表内返回 false。
+// 调用方须持 poolMu。
+func badSesAddLocked(s string) bool {
+	if s == "" || badSes[s] {
+		return false
+	}
+	badSes[s] = true
+	badSesPrefix = append(badSesPrefix, s)
+	return true
+}
+
+// isBadSesLocked 精确命中，或以名单里的残条为前缀，即判毒。调用方须持 poolMu。
+// 前缀比对只对 len(p) < len(s) 生效：全长 id 互不为前缀，故不误伤。
+func isBadSesLocked(s string) bool {
+	if s == "" {
+		return false
+	}
+	if badSes[s] {
+		return true
+	}
+	for _, p := range badSesPrefix {
+		if len(p) < len(s) && strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // badSesAppendLocked 追加一行到烧号名单。调用方须持 poolMu。
@@ -111,12 +156,13 @@ func markBadSesLocked(s string) {
 	}
 	if len(badSes) >= badSesCap {
 		badSes = map[string]bool{}
+		badSesPrefix = nil
 		log.Printf("[pool] bad-session table full, reset")
 		if err := os.Remove(badSesFilePath()); err != nil && !os.IsNotExist(err) {
 			log.Printf("[pool] poison reset %s: %v", badSesFilePath(), err)
 		}
 	}
-	badSes[s] = true
+	badSesAddLocked(s)
 	badSesAppendLocked(s)
 }
 
@@ -221,7 +267,7 @@ func pickGenuineLocked(fp string, salt uint64) string {
 	start := (genuineHash(fp) + salt) % uint64(n)
 	for i := 0; i < n; i++ {
 		s := genuineSessions[(int(start)+i)%n]
-		if !badSes[s] {
+		if !isBadSesLocked(s) {
 			return s
 		}
 	}
@@ -254,7 +300,7 @@ func poolLookup(fp string) string {
 	if !ok {
 		return ""
 	}
-	if badSes[e.Session] {
+	if isBadSesLocked(e.Session) {
 		// 别家 fp 轮换时烧掉的共享 session：本 fp 视同失配，下次借用重取。
 		// 不 touch 不复用，免每家各交一次 403 学费。
 		delete(poolMap, fp)
@@ -509,13 +555,19 @@ func poolLoad() {
 	}
 	poolMap = map[string]*poolEntry{}
 	poolQ = nil
+	skipped := 0
 	for _, kv := range all {
-		if badSes[kv.e.Session] {
+		if isBadSesLocked(kv.e.Session) {
 			// 额度已打尽的 session 不能随快照复活：再用一次就把出口 IP 拖下水。
+			// 残条名前缀命中也走这里，重启后旧快照里的毒号同样拦得住。
+			skipped++
 			continue
 		}
 		poolMap[kv.k] = kv.e
 		poolQ = append(poolQ, kv.k)
+	}
+	if skipped > 0 {
+		log.Printf("[pool] skipped %d poisoned sessions in %s", skipped, path)
 	}
 	if len(genuineSessions) > 0 {
 		dropped := 0
@@ -541,7 +593,7 @@ func poolLoad() {
 		}
 	}
 	if len(all) > 0 {
-		log.Printf("[pool] loaded %d sessions from %s", len(all), path)
+		log.Printf("[pool] loaded %d sessions from %s", len(poolMap), path)
 	}
 }
 
@@ -554,6 +606,7 @@ func resetPoolForTest() {
 	poolSaveSeq = 0
 	poolSavedSeq = 0
 	badSes = map[string]bool{}
+	badSesPrefix = nil
 	freeLimitUntil.Store(0)
 	freeLimitDur.Store(0)
 	freeLimitIP.Store("")

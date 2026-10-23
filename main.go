@@ -867,7 +867,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 				upSes = poolSes
 			}
 			log.Printf("[REQ %s] free-usage 429 ses=%s, poisoned+rotate, cooldown %s (total=%d)",
-				reqID, shortStr(oldSes, 20), cd, freeLimitCount.Load())
+				reqID, oldSes, cd, freeLimitCount.Load())
 			writeBodyWithType(w, resp, 429, bpeek)
 			return
 		}

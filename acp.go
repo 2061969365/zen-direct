@@ -280,6 +280,7 @@ func acpMintSession() string {
 			res.err, timedOut, waitErr, stderr.String())
 		return ""
 	}
-	log.Printf("[acp] minted %s in %dms", shortStr(res.sid, 20), time.Since(t0).Milliseconds())
+	// 同 svc.go：日志里的 session id 一律全长，便于直接抄进毒名单。
+	log.Printf("[acp] minted %s in %dms", res.sid, time.Since(t0).Milliseconds())
 	return res.sid
 }

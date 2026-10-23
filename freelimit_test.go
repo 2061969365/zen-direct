@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -225,5 +226,71 @@ func TestNonFreeLimit429Passthru(t *testing.T) {
 	}
 	if _, blocked := freeLimitBlocked(); blocked {
 		t.Fatal("非免费额度 429 不应触发冷却")
+	}
+}
+
+// 毒名单抄进截断 id（2026-10-23 事故现场）：429 日志曾把 ses= 截成 20 位，
+// 抄进名单后精确查表永远放不中，已打满额的 session 又被发出去，干净出口 IP
+// 当场被连坐。残条必须按前缀命中，且快照里的毒号重启即丢。
+func TestPoisonTruncatedEntryStillFilters(t *testing.T) {
+	resetPoolForTest()
+	defer resetPoolForTest()
+	full := "ses_f88daf257ffeVeQTe3LMg59tzS"
+	other := "ses_f70e48a05ffeb1MPMKVO3uLSPu"
+	genuineSessions = []string{full, other}
+	genuineSet = map[string]bool{full: true, other: true}
+
+	const trunc = "ses_f88daf257ffeVeQT"
+	if err := os.WriteFile(badSesFilePath(), []byte(trunc+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badSesLoad()
+
+	poolMu.Lock()
+	hit := isBadSesLocked(full)
+	miss := isBadSesLocked(other)
+	poolMu.Unlock()
+	if !hit {
+		t.Fatalf("截断条目 %q 应前缀命中全长 id %q", trunc, full)
+	}
+	if miss {
+		t.Fatalf("不得误伤无关 session %q", other)
+	}
+	// 各 salt 定点选号都不该再捡回毒号。
+	for salt := uint64(0); salt < 8; salt++ {
+		if s := pickGenuine("fp", salt); s == full {
+			t.Fatalf("毒 session 又被选中（salt=%d）", salt)
+		}
+	}
+
+	// 旧快照存的是全长 id：重启加载时同样得拦住。
+	dir := t.TempDir()
+	oldPoolFile := poolFile
+	poolFile = filepath.Join(dir, "ses.json")
+	defer func() { poolFile = oldPoolFile }()
+	snap := `{"fp:bad":{"ses":"` + full + `","seen":"` + time.Now().Format(time.RFC3339Nano) + `","gen":true}}`
+	if err := os.WriteFile(poolFile, []byte(snap), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	poolLoad()
+	if got := poolLookup("fp:bad"); got != "" {
+		t.Fatalf("毒号不得随快照复活，得 %q", got)
+	}
+}
+
+// 只有 ses_ 这种脏条目不准参与前缀匹配：否则一行坏数据能把整个池判毒。
+func TestPoisonTooShortIgnored(t *testing.T) {
+	resetPoolForTest()
+	defer resetPoolForTest()
+	if err := os.WriteFile(badSesFilePath(), []byte("ses_\nses_f88daf257ffeVeQT\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badSesLoad()
+	poolMu.Lock()
+	shortHit := isBadSesLocked("ses_x")
+	n := len(badSes)
+	poolMu.Unlock()
+	if shortHit || n != 1 {
+		t.Fatalf("过短条目应被忽略：毒表 %d 条，ses_x 判毒=%v", n, shortHit)
 	}
 }

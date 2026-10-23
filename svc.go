@@ -189,9 +189,11 @@ func svcMintSession() string {
 		return ""
 	}
 	if !strings.HasPrefix(out.Data.ID, "ses_") {
-		svcLogFail("[svc] bad session id %q", shortStr(out.Data.ID, 24))
+		svcLogFail("[svc] bad session id %q", out.Data.ID)
 		return ""
 	}
-	log.Printf("[svc] minted %s in %dms", shortStr(out.Data.ID, 20), time.Since(t0).Milliseconds())
+	// 打全长 id：截断日志是毒名单抄错的源头（2026-10-23 事故），日志里的
+	// session id 必须能直接抄进 poisoned_sessions.txt。
+	log.Printf("[svc] minted %s in %dms", out.Data.ID, time.Since(t0).Milliseconds())
 	return out.Data.ID
 }
