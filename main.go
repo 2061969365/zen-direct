@@ -363,10 +363,15 @@ var (
 	freeLimitDur   atomic.Int64 // 当前冷却时长（ns），成功一次归零，再犯翻倍
 )
 
-const freeLimitDurCap = 40 * time.Minute
+// 封顶 6 小时：升级档只在「冷却到期又被 429」时翻倍，是有证据才加码；
+// 45 → 90 → 180 → 360 分钟，够覆盖连坐 + 每日额度重置（07:59）之前的空窗。
+const freeLimitDurCap = 6 * time.Hour
 
-// freeLimitCooldown 基础冷却时长，默认 10 分钟：实测连坐期 >5 分钟，
-// 本地复现是 16:11 中招、16:18 同 IP 新会话恢复（约 7 分钟）。
+// freeLimitCooldown 基础冷却时长，默认 45 分钟。实测（GitHub Actions
+// poison-decay-sparse，2026-10-23）：碰一次毒 session 之后，同一出口 IP 上
+// 全新 session 在 +5/+15/+30/+45 分钟全是 429——连坐期不是早先估的 7 分钟，
+// 而是 ≥45 分钟。冷却太短只会拿新 session 去撞，撞一次再连坐一次。
+// 换出口 IP 会立刻解除冷却（见 freeLimitIP），手动切线路不受此限。
 // DIRECT_FREELIMIT_COOLDOWN 秒可调。
 func freeLimitCooldown() time.Duration {
 	if v := os.Getenv("DIRECT_FREELIMIT_COOLDOWN"); v != "" {
@@ -374,7 +379,7 @@ func freeLimitCooldown() time.Duration {
 			return time.Duration(n) * time.Second
 		}
 	}
-	return 10 * time.Minute
+	return 45 * time.Minute
 }
 
 // nextFreeLimitCooldown 冷却期内又中一次说明 IP 还没解禁：翻倍再等。
