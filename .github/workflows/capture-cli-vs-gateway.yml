@@ -1,0 +1,120 @@
+name: capture-cli-vs-gateway
+
+# 同一台 runner、同一个出口 IP：把 CLI 和网关都指向本地抓包代理，
+# 逐字对比两边真正发往 opencode.ai 的请求（路径、头、body、上游状态）。
+# 目的：找出为什么 CLI 200 而网关 429。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: install opencode CLI
+        run: |
+          npm install -g @opencode/cli@latest 2>&1 | tail -2
+          opencode --version
+      - name: egress IP
+        run: curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; j=json.load(sys.stdin); print(j["query"], j["city"])'
+      - name: capture both clients on one IP
+        run: |
+          set -u
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export OPENCODE_DISABLE_AUTOUPDATE=1
+          W="$PWD/_cap"; mkdir -p "$W"
+          go build -trimpath -o zen-direct .
+
+          python3 tools/capture_proxy.py --port 19100 --out "$W/captures" >"$W/proxy.log" 2>&1 &
+          PP=$!
+          sleep 2
+          cat "$W/proxy.log"
+
+          echo "=== CLI through the capture proxy ==="
+          OPENCODE_CONFIG_CONTENT='{"provider":{"opencode":{"options":{"baseURL":"http://127.0.0.1:19100/inference/v1"}}}}' \
+            timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free \
+            "Reply with the single word: ok" >"$W/cli.out" 2>"$W/cli.err"
+          echo "cli_exit=$?"
+          tail -3 "$W/cli.out"
+          grep -Ei 'error|429|limit' "$W/cli.err" | tail -5 || true
+
+          echo "=== gateway through the same capture proxy ==="
+          : > "$W/genuine.txt"
+          nohup env \
+            PORT=18081 \
+            OPENCODE_ZEN_BASE=http://127.0.0.1:19100/inference/v1 \
+            DIRECT_FRESH_PER_TURN=0 \
+            DIRECT_DEBUG=1 \
+            DIRECT_DIAG=1 \
+            LOG_FILE="$W/gw.log" \
+            SHIM_SESSION_FILE="$W/shim.json" \
+            DIRECT_POISON_FILE="$W/poison.txt" \
+            GENUINE_SESSION_FILE="$W/genuine.txt" \
+            ./zen-direct >"$W/gw.err" 2>&1 &
+          GW=$!
+          for i in $(seq 1 60); do
+            curl -sf -m 2 http://127.0.0.1:18081/health >/dev/null 2>&1 && break
+            sleep 0.3
+          done
+          python3 - <<'PY' | tee "$W/gw.out"
+          import json, urllib.request, urllib.error
+          body = json.dumps({"model": "deepseek-v4.1-flash-free", "stream": False,
+                             "messages": [{"role": "system", "content": "You are an AI agent powered by DeepSeek Harness."},
+                                          {"role": "user", "content": "capture check 777"}]}).encode()
+          req = urllib.request.Request("http://127.0.0.1:18081/v1/chat/completions",
+                                       data=body, method="POST")
+          req.add_header("Content-Type", "application/json")
+          try:
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  print("GW ->", r.status, r.read(120)[:120])
+          except urllib.error.HTTPError as e:
+              print("GW ->", e.code, e.read(200)[:200], "retry-after=", e.headers.get("Retry-After"))
+          PY
+          sleep 1
+
+          echo "=== captures ==="
+          python3 - <<'PY'
+          import glob, json, os
+          for p in sorted(glob.glob(os.environ["W"] + "/captures/*.json")):
+              j = json.load(open(p, encoding="utf-8"))
+              if j.get("method") != "POST":
+                  continue
+              try:
+                  b = json.loads(j.get("body") or "{}")
+              except Exception:
+                  b = {}
+              if "messages" not in b and "input" not in b:
+                  continue
+              print("\n### %s  path=%s  upstream=%s" % (os.path.basename(p), j.get("path"), j.get("upstream_status")))
+              h = {k.lower(): v for k, v in (j.get("headers") or {}).items()}
+              for k in sorted(h):
+                  if k in ("content-length", "accept-encoding", "connection", "host"):
+                      continue
+                  print("  %-28s %s" % (k + ":", h[k]))
+              print("  body.keys:", sorted(b.keys()))
+              print("  model=%r stream=%r stream_options=%r tools=%d max_completion_tokens=%r"
+                    % (b.get("model"), b.get("stream"), b.get("stream_options"),
+                       len(b.get("tools") or []), b.get("max_completion_tokens")))
+              msgs = b.get("messages") or b.get("input") or []
+              print("  msg roles:", [m.get("role") for m in msgs][:6])
+              if b.get("tools"):
+                  print("  tool names:", [t.get("name") or (t.get("function") or {}).get("name") for t in b["tools"]][:10])
+              ub = j.get("upstream_body") or ""
+              print("  upstream body:", ub[:160].replace("\n", " "))
+          PY
+
+          echo "=== gateway log ==="
+          grep -E '\[REQ|free-usage|session policy|genuine' "$W/gw.log" | sed -E 's/ debug upBody.*//' | tail -20
+          kill "$GW" "$PP" 2>/dev/null || true
+        env:
+          W: ${{ github.workspace }}/_cap
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: captures
+          path: _cap
