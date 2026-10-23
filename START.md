@@ -68,6 +68,14 @@ bat 顶部 / ps1 `CONFIG` 区：
 铸造链（各档现均可用）：service 现铸 → harvest 名单 → ACP 现铸 →
 本地 descending 现签。`Gen` 标记、烧号表、重启过滤保留。
 
+毒名单（`poisoned_sessions.txt`）按**额度窗口**管理：打满的 session 要到
+北京时间次日 07:59 才解禁，所以名单也在 07:59 整表作废（运行时清表+删文件，
+启动时发现文件早于上次重置同样丢弃）。启动还会扫当天日志
+（`zen-direct-YYYYMMDD.err.log`，含 `.1`–`.3` 轮转片）里的
+`free-usage 429 ses=…`，把 id 收回毒库——进程被杀或名单被手工改过都不丢证据。
+默认每个对话每轮换一条新号（`DIRECT_FRESH_PER_TURN=1`），吃到 429 时记毒 +
+换号并封到下一个 07:59（换出口 IP 立即解封），不做当次重试。
+
 旧注：此前误判为“白名单登记制”；实测证明纯结构判定（低 12 位），
 本地 descending 现签与本体无异。service/harvest/ACP 链保留作冗余，
 裸机（Railway/容器）单二进制即满血。

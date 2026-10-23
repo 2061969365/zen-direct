@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -90,62 +92,137 @@ func badSesFilePath() string {
 }
 
 // badSesLoad 启动时读烧号名单（poolLoad 内先于快照加载调用）。
+// 名单只覆盖「当前窗口」（上次 07:59 之后）：文件太旧整份丢弃，随后再把当天
+// 日志里 free-usage 429 的 id 收回来——重启不丢今天的证据。
 func badSesLoad() {
 	path := badSesFilePath()
 	now := time.Now()
-	// 上一轮窗口留下的名单：整份作废（里面的号已经解禁，留着只会误杀）。
+	stale := false
 	if st, err := os.Stat(path); err == nil && st.ModTime().Before(lastFreeReset(now)) {
 		log.Printf("[pool] poison list %s predates the last reset, dropping", path)
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			log.Printf("[pool] poison drop %s: %v", path, err)
 		}
-		poolMu.Lock()
-		poisonResetAt = nextFreeReset(now)
-		poolMu.Unlock()
-		return
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("[pool] poison load %s: %v", path, err)
-		}
-		poolMu.Lock()
-		poisonResetAt = nextFreeReset(now)
-		poolMu.Unlock()
-		return
+		stale = true
 	}
 	poolMu.Lock()
 	defer poolMu.Unlock()
 	poisonResetAt = nextFreeReset(now)
 	n := 0
-	for _, ln := range strings.Split(string(b), "\n") {
-		s := strings.TrimSpace(ln)
-		if s == "" || strings.HasPrefix(s, "#") {
-			continue
-		}
-		if len(s) < 10 {
-			log.Printf("[pool] poison entry %q too short, ignored", s)
-			continue
-		}
-		if badSesAddLocked(s) {
-			n++
-		}
-		if len(s) < sesIDLen {
-			// 残条：精确匹配废掉，只能靠前缀兜。出现这条日志就说明有抄错的名单，
-			// 该换成完整 id（网关 429 日志已改打全长 id）。
-			log.Printf("[pool] poison entry %s truncated (%d<%d), prefix-match enabled", s, len(s), sesIDLen)
+	if !stale {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("[pool] poison load %s: %v", path, err)
+			}
+		} else {
+			for _, ln := range strings.Split(string(b), "\n") {
+				s := strings.TrimSpace(ln)
+				if s == "" || strings.HasPrefix(s, "#") {
+					continue
+				}
+				if len(s) < 10 {
+					log.Printf("[pool] poison entry %q too short, ignored", s)
+					continue
+				}
+				if badSesAddLocked(s) {
+					n++
+				}
+				if len(s) < sesIDLen {
+					// 残条：精确匹配废掉，只能靠前缀兜。出现这条日志就说明有抄错的名单，
+					// 该换成完整 id（网关 429 日志已改打全长 id）。
+					log.Printf("[pool] poison entry %s truncated (%d<%d), prefix-match enabled", s, len(s), sesIDLen)
+				}
+			}
 		}
 	}
 	if n > 0 {
 		log.Printf("[pool] loaded %d poisoned sessions from %s", n, path)
 	}
+	if m := badSesHarvestTodayLogLocked(); m > 0 {
+		log.Printf("[pool] harvested %d poisoned sessions from today's log", m)
+	}
 }
 
+// logDateRe 日志文件名里的日期段（launcher 命名 zen-direct-20261023.err.log）。
+var logDateRe = regexp.MustCompile(`\d{8}`)
+
+// todayLogPath 当天日志路径（基名；轮转片见 harvest）。未设 LOG_FILE 返回 ""。
+func todayLogPath() string {
+	lp := env("LOG_FILE", "")
+	if lp == "" {
+		return ""
+	}
+	base := filepath.Base(lp)
+	if logDateRe.MatchString(base) {
+		base = logDateRe.ReplaceAllString(base, time.Now().In(freeResetZone).Format("20060102"))
+	}
+	return filepath.Join(filepath.Dir(lp), base)
+}
+
+// badSesHarvestTodayLogLocked 从今天的网关日志回收 free-usage 429 的 session id。
+// 进程被杀、名单被手工改过、内存表被清空后，重启也能把「今天已经打满」的证据
+// 捡回来；只读今天这一个文件（含 .1-.3 轮转片），昨天的不碰。调用方须持 poolMu。
+func badSesHarvestTodayLogLocked() int {
+	path := todayLogPath()
+	if path == "" {
+		return 0
+	}
+	n := 0
+	for _, p := range []string{path, path + ".1", path + ".2", path + ".3"} {
+		f, err := os.Open(p)
+		if err != nil {
+			continue
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 64<<10), 8<<20)
+		for sc.Scan() {
+			id := freeLimitSesFromLine(sc.Text())
+			if id == "" {
+				continue
+			}
+			if badSesAddLocked(id) {
+				n++
+			}
+		}
+		f.Close()
+	}
+	return n
+}
+
+// freeLimitSesFromLine 从 "… free-usage 429 ses=<id>, poisoned+rotate …" 取 id。
+// 老日志里这一段的 id 可能只有 20 位，交给前缀匹配兜底。
+func freeLimitSesFromLine(line string) string {
+	const marker = "free-usage 429 ses="
+	i := strings.Index(line, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+len(marker):]
+	if j := strings.IndexAny(rest, ", \t\r\n"); j >= 0 {
+		rest = rest[:j]
+	}
+	rest = strings.TrimSpace(rest)
+	if !strings.HasPrefix(rest, "ses_") || len(rest) < 10 {
+		return ""
+	}
+	return rest
+}
+
+
 // badSesAddLocked 记一条毒名单（精确表 + 前缀表）。已在表内返回 false。
+// 残条（日志里被截断的短 id）若已被某条全长 id 覆盖，就不再重复记。
 // 调用方须持 poolMu。
 func badSesAddLocked(s string) bool {
 	if s == "" || badSes[s] {
 		return false
+	}
+	if len(s) < sesIDLen {
+		for full := range badSes {
+			if len(full) >= sesIDLen && strings.HasPrefix(full, s) {
+				return false
+			}
+		}
 	}
 	badSes[s] = true
 	badSesPrefix = append(badSesPrefix, s)

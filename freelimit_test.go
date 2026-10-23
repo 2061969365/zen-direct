@@ -344,3 +344,75 @@ func TestPoisonTooShortIgnored(t *testing.T) {
 		t.Fatalf("过短条目应被忽略：毒表 %d 条，ses_x 判毒=%v", n, shortHit)
 	}
 }
+
+// 启动时把当天日志里 free-usage 429 的 id 收回毒库：进程被杀 / 名单被手工改过
+// 之后，重启也不丢「今天已经打满」的证据。
+func TestHarvestTodayLog(t *testing.T) {
+	resetPoolForTest()
+	defer resetPoolForTest()
+	dir := t.TempDir()
+	today := time.Now().In(freeResetZone).Format("20060102")
+	logPath := filepath.Join(dir, "zen-direct-"+today+".err.log")
+	hit := "ses_f7c52721affeC0Osw3mn0CAIT6"
+	lines := []string{
+		"2026/10/23 17:07:18 [REQ resp_dir_1] free-usage 429 ses=" + hit + ", poisoned+rotate, cooldown 13h30m (total=1)",
+		"2026/10/23 17:07:19 [REQ resp_dir_2] free-usage 429 ses=ses_deadbeef00000000000000000, poisoned+rotate",
+		"2026/10/23 17:07:20 [REQ resp_dir_3] in=chat model=x ses=ses_notapoison new=true",
+		"2026/10/23 17:07:21 [REQ resp_dir_4] upstream 429 (not free-limit): too many requests",
+	}
+	if err := os.WriteFile(logPath, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LOG_FILE", logPath)
+	badSesLoad()
+
+	poolMu.Lock()
+	a := isBadSesLocked(hit)
+	b := isBadSesLocked("ses_deadbeef00000000000000000")
+	c := isBadSesLocked("ses_notapoison")
+	poolMu.Unlock()
+	if !a || !b {
+		t.Fatalf("应回收日志里的两条 429：428=%v deadbeef=%v", a, b)
+	}
+	if c {
+		t.Fatal("普通请求行的 ses= 不应记毒")
+	}
+}
+
+// 只认今天的日志：文件名是昨天的，todayLogPath 会换成今天，读不到即不回收。
+func TestHarvestSkipsOtherDays(t *testing.T) {
+	resetPoolForTest()
+	defer resetPoolForTest()
+	dir := t.TempDir()
+	yesterday := time.Now().In(freeResetZone).AddDate(0, 0, -1).Format("20060102")
+	logPath := filepath.Join(dir, "zen-direct-"+yesterday+".err.log")
+	hit := "ses_f7c52721affeC0Osw3mn0CAIT6"
+	if err := os.WriteFile(logPath, []byte("free-usage 429 ses="+hit+", poisoned\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LOG_FILE", logPath)
+	badSesLoad()
+	poolMu.Lock()
+	poisoned := isBadSesLocked(hit)
+	poolMu.Unlock()
+	if poisoned {
+		t.Fatal("昨天的日志不应参与回收")
+	}
+}
+
+// 行解析：只认 free-usage 429 那条尾巴，截断/无标记/超短都要正确处理。
+func TestFreeLimitSesFromLine(t *testing.T) {
+	cases := []struct{ line, want string }{
+		{"[REQ x] free-usage 429 ses=ses_aaaaaaaaaaaaaaaaaaaaaaaaaa, poisoned+rotate", "ses_aaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		{"[REQ x] free-usage 429 ses=ses_f88daf257ffeVeQT, poisoned+rotate, cooldown 45m0s", "ses_f88daf257ffeVeQT"},
+		{"[REQ x] upstream 429 (not free-limit): too many requests", ""},
+		{"[REQ x] free-usage 429 ses=bad_value,", ""},
+		{"[REQ x] free-usage 429 ses=, poisoned", ""},
+		{"[REQ x] in=chat ses=ses_fine", ""},
+	}
+	for _, c := range cases {
+		if got := freeLimitSesFromLine(c.line); got != c.want {
+			t.Fatalf("%q -> %q，期望 %q", c.line, got, c.want)
+		}
+	}
+}
