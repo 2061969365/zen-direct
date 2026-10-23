@@ -19,9 +19,6 @@ jobs:
   find-dead:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    outputs:
-      ses: ${{ steps.probe.outputs.ses }}
-      hits: ${{ steps.probe.outputs.hits }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -31,7 +28,6 @@ jobs:
         run: go build -trimpath -ldflags '-s -w' -o zen-direct-linux-amd64 .
 
       - name: Probe the known candidates until one still answers 429
-        id: probe
         env:
           CANDIDATES: ${{ secrets.POISON_CANDIDATES }}
         run: |
@@ -74,7 +70,7 @@ jobs:
             if [ "$code" = "429" ]; then
               found="$id"
               hits="$i"
-              echo "    cooled/gone: this one is still exhausted"
+              echo "    this one is still exhausted"
               break
             fi
             if [ "$code" != "200" ]; then
@@ -82,14 +78,26 @@ jobs:
               break
             fi
           done <<< "$CANDIDATES"
-          echo "ses=$found" >> "$GITHUB_OUTPUT"
-          echo "hits=$hits" >> "$GITHUB_OUTPUT"
           if [ -z "$found" ]; then
             echo "None of the candidates returns 429 any more: either they recovered"
             echo "or those 429s were egress-IP taint rather than session exhaustion."
             echo "Nothing to arm with - refusing to claim a poison test."
             exit 1
           fi
+          # 注意：job output / env 里带 secret 的值会被 GitHub 抹成空串（"Skip
+          # output 'ses' since it may contain secret"），第一次跑就是这么空转的。
+          # 所以走 artifact 文件，不经 output。
+          printf '%s\n' "$found" > dead.txt
+          printf '%s\n' "$hits" > hits.txt
+          echo "captured candidate #$hits ($(wc -c < dead.txt) bytes) into dead.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dead-ses
+          path: |
+            dead.txt
+            hits.txt
+          retention-days: 1
 
   armed:
     needs: find-dead
@@ -100,18 +108,25 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.23'
+      - uses: actions/download-artifact@v4
+        with:
+          name: dead-ses
       - name: Build
         run: go build -trimpath -ldflags '-s -w' -o zen-direct-linux-amd64 .
 
       - name: Seed the pool with the freshly verified dead session
-        env:
-          DEAD: ${{ needs.find-dead.outputs.ses }}
         run: |
           set -euo pipefail
-          echo "candidate #${{ needs.find-dead.outputs.hits }} produced the 429"
-          printf '%s\n' "$DEAD" > genuine.txt   # 池里只有这条死号
-          printf '%s\n' "$DEAD" > poison.txt    # 毒名单也认它
-          echo "genuine=$(wc -l < genuine.txt) poison=$(wc -l < poison.txt) len=$(head -1 poison.txt | wc -c)"
+          echo "find-dead captured candidate #$(cat hits.txt)"
+          bytes=$(wc -c < dead.txt | tr -d ' ')
+          echo "dead.txt bytes=$bytes"
+          if [ "$bytes" -lt 30 ]; then
+            echo "FAIL: dead id did not survive the job handoff"
+            cat dead.txt; exit 1
+          fi
+          cp dead.txt genuine.txt   # 池里只有这条死号
+          cp dead.txt poison.txt    # 毒名单也认它
+          echo "genuine=$(cat genuine.txt | wc -l) poison=$(cat poison.txt | wc -l)"
 
       - name: Start gateway against the real upstream
         run: |
@@ -157,10 +172,9 @@ jobs:
           done
 
       - name: Assert fresh id per turn and no dead id on the wire
-        env:
-          DEAD: ${{ needs.find-dead.outputs.ses }}
         run: |
           set -euo pipefail
+          DEAD=$(tr -d '[:space:]' < dead.txt)
           grep -o 'ses=[A-Za-z0-9_]*' gw.log | sed 's/^ses=//' | grep -v '^$' | sort -u > used.txt || true
           echo "--- upstream sessions the gateway used ---"
           sed -E 's/(ses_.{6}).*/\1…/' used.txt
@@ -195,6 +209,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.23'
+      - uses: actions/download-artifact@v4
+        with:
+          name: dead-ses
       - name: Build
         run: go build -trimpath -ldflags '-s -w' -o zen-direct-linux-amd64 .
 
@@ -229,10 +246,10 @@ jobs:
           fi
 
       - name: The dead id still answers 429 from another IP
-        env:
-          DEAD: ${{ needs.find-dead.outputs.ses }}
         run: |
           set -euo pipefail
+          DEAD=$(tr -d '[:space:]' < dead.txt)
+          if [ "${#DEAD}" -lt 30 ]; then echo "FAIL: dead id missing"; exit 1; fi
           printf '%s\n' "$DEAD" > genuine2.txt
           rm -f /tmp/c2-poison.txt
           PORT=18082 \
