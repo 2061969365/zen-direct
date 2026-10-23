@@ -12,6 +12,8 @@ $LogKeepDays = 7             # 日志保留天数
 $HideWindow  = $true         # $false=显示窗口（排查用）
 $ZenBase     = 'https://opencode.ai/inference/v1'  # 上游 base（V2）
 # 会话池；$null=exe 同目录 shim_sessions.json
+# 换号策略：0=一对话一号（撞 429 才换） 1=每轮新号
+$FreshPerTurn = '0'
 $PoolFile    = $null
 # =========================================================
 
@@ -39,6 +41,7 @@ $env:DIRECT_CONCURRENCY = $Concurrency
 $env:LOG_FILE          = $log
 $env:LOG_MAX_MB        = "$LogMaxMB"
 $env:OPENCODE_ZEN_BASE = $ZenBase
+$env:DIRECT_FRESH_PER_TURN = $FreshPerTurn
 
 # Run-WithTimeout：外部命令硬超时（opencode CLI 在某些语境下会永久挂起，
 # 双击快捷方式（-WindowStyle Hidden）下没有任何反馈，必须自己兜底）。

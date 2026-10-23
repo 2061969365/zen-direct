@@ -20,6 +20,9 @@ REM delete logs older than N days
 set "LOG_KEEP_DAYS=7"
 REM 1 = hide window ; 0 = show window (for debugging)
 set "HIDE_WINDOW=1"
+REM session policy: 0 = one session per conversation (rotate only on 429)
+REM                 1 = a fresh upstream session on every turn
+set "DIRECT_FRESH_PER_TURN=0"
 REM upstream base URL (V2)
 set "OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1"
 REM ------------------------------------------------------------------------
@@ -67,6 +70,7 @@ set "SHIM_SESSION_FILE=%SHIM_SESSION_FILE%"
 set "LOG_FILE=%LOG_FILE%"
 set "LOG_MAX_MB=%LOG_MAX_MB%"
 set "OPENCODE_ZEN_BASE=%OPENCODE_ZEN_BASE%"
+set "DIRECT_FRESH_PER_TURN=%DIRECT_FRESH_PER_TURN%"
 
 REM genuine session harvest (free tier only honors sessions seen from real
 REM opencode; minted ses always 403). Best-effort, never blocks startup.

@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"hash/fnv"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,14 +72,50 @@ func poisonExpireLocked(now time.Time) {
 		return
 	}
 	n := len(badSes)
+	if n > 0 {
+		badSesArchiveLocked(poisonResetAt)
+	}
 	badSes = map[string]bool{}
 	badSesPrefix = nil
 	poisonResetAt = nextFreeReset(now)
 	if n > 0 {
-		log.Printf("[pool] free window reset, dropped %d poisoned sessions", n)
+		log.Printf("[pool] free window reset, dropped %d poisoned sessions (archived)", n)
 	}
 	if err := os.Remove(badSesFilePath()); err != nil && !os.IsNotExist(err) {
 		log.Printf("[pool] poison reset %s: %v", badSesFilePath(), err)
+	}
+}
+
+// badSesArchiveLocked 归档本窗口的毒号：窗口重置时追加进 poison_archive.txt，
+// 带窗口结束时间。日志只留 7 天，归档文件常驻——「每天记了哪些毒号」可查，
+// 也给 turns 观测做对照。调用方须持 poolMu。
+func badSesArchiveLocked(ended time.Time) {
+	ids := make([]string, 0, len(badSes))
+	for id := range badSes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	path := filepath.Join(filepath.Dir(badSesFilePath()), "poison_archive.txt")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		log.Printf("[pool] poison archive mkdir: %v", err)
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		log.Printf("[pool] poison archive %s: %v", path, err)
+		return
+	}
+	defer f.Close()
+	if _, err := fmt.Fprintf(f, "# window ended %s (%d ids)\n",
+		ended.In(freeResetZone).Format("2006-01-02 15:04"), len(ids)); err != nil {
+		log.Printf("[pool] poison archive write %s: %v", path, err)
+		return
+	}
+	for _, id := range ids {
+		if _, err := fmt.Fprintln(f, id); err != nil {
+			log.Printf("[pool] poison archive write %s: %v", path, err)
+			return
+		}
 	}
 }
 
@@ -294,6 +332,33 @@ type poolEntry struct {
 	// Gen 真 session（service/ACP/harvest 名单）vs 现签假 session。
 	// 重启过滤只认 Gen 或名单成员；老快照缺该键按 false（名单兜底）。
 	Gen bool `json:"gen,omitempty"`
+	// Turns 这条上游 session 已经成功服务了几轮。纯观测：429 时打进日志，
+	// 攒一天就能量出"一条号能吃多少轮"，再决定要不要提前换号。
+	Turns int `json:"turns,omitempty"`
+}
+
+// poolNoteTurn 记一次成功轮次（给 429 日志里的 turns=N 用）。
+func poolNoteTurn(fp string) {
+	if fp == "" {
+		return
+	}
+	poolMu.Lock()
+	if e, ok := poolMap[fp]; ok {
+		e.Turns++
+		poolDirty = true
+	}
+	poolMu.Unlock()
+}
+
+// poolTurnsLocked 当前 fp 名下那条号已经服务的轮数。调用方须持 poolMu。
+func poolTurnsLocked(fp string) int {
+	if fp == "" {
+		return 0
+	}
+	if e, ok := poolMap[fp]; ok {
+		return e.Turns
+	}
+	return 0
 }
 
 func poolFilePath() string {

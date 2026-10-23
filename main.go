@@ -350,6 +350,16 @@ func isFreeUsageLimit(body []byte) bool {
 		bytes.Contains(body, []byte("Free usage limit reached"))
 }
 
+// isPlainThrottle 明确是限流（不是额度用尽）：这种 429 不该记毒——号是好的，
+// 只是被限速了，记毒等于白扔一条可用号。
+func isPlainThrottle(body []byte) bool {
+	s := bytes.ToLower(body)
+	return bytes.Contains(s, []byte("too many requests")) ||
+		bytes.Contains(s, []byte("rate limit")) ||
+		bytes.Contains(s, []byte("ratelimit")) ||
+		bytes.Contains(s, []byte("rate_limit"))
+}
+
 // 免费额度 429 的 IP 连坐。实测（GitHub Actions，两台不同出口 IP）：
 //   - 用一个打满额度的 session -> 429；
 //   - 同一 IP 紧接着发全新 session（从未上游出现过）-> 也 429，
@@ -866,8 +876,8 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		}
 	}
 	// 429 FreeUsageLimitError：免费额度按上游 session 计，打满后这条 session 会
-	// 一直 429 到窗口重置；且用它打一次，出口 IP 会被连坐数分钟（全新 session
-	// 也 429）。故这里不赌重试：记毒（落盘）+ 换 session + 进冷却，原样回 429。
+	// 一直 429 到第二天 07:59 窗口重置；用它打一次，出口 IP 也会被连坐同样久。
+	// 故这里不赌重试：记毒（落盘 + 归档）+ 换 session + 冷却到窗口重置，原样回 429。
 	// 旧逻辑对 429 一律透传且不换号，等于每次续聊都把毒 session 再喂一次，
 	// 复现“聊到一半整个网关全 429”。
 	if resp.StatusCode == 429 {
@@ -884,17 +894,35 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 			oldSes := upSes
 			poolMu.Lock()
 			markBadSesLocked(oldSes) // 落盘：重启后不再从 genuine 名单捡回来
+			turns := poolTurnsLocked(fp)
 			poolMu.Unlock()
 			if usePool && fp != "" {
 				poolSes, _ = poolRotate(fp) // 下一次请求用干净 session
 				upSes = poolSes
 			}
-			log.Printf("[REQ %s] free-usage 429 ses=%s, poisoned+rotate, cooldown %s (total=%d)",
-				reqID, oldSes, cd, freeLimitCount.Load())
+			log.Printf("[REQ %s] free-usage 429 ses=%s turns=%d, poisoned+rotate, cooldown %s (total=%d)",
+				reqID, oldSes, turns, cd, freeLimitCount.Load())
 			writeBodyWithType(w, resp, 429, bpeek)
 			return
 		}
-		log.Printf("[REQ %s] upstream 429 (not free-limit): %.300s", reqID, string(bpeek))
+		// 429 但认不出类型：别赌。上游改措辞/加新错误码时，若真是额度用尽，
+		// 继续用这条号就会把整天的 IP 连坐掉；代价只是少一条号。
+		if !isPlainThrottle(bpeek) {
+			oldSes := upSes
+			poolMu.Lock()
+			markBadSesLocked(oldSes)
+			turns := poolTurnsLocked(fp)
+			poolMu.Unlock()
+			if usePool && fp != "" {
+				poolSes, _ = poolRotate(fp)
+				upSes = poolSes
+			}
+			log.Printf("[REQ %s] 429 unknown body, poisoning ses=%s turns=%d to be safe: %.200s",
+				reqID, oldSes, turns, string(bpeek))
+			writeBodyWithType(w, resp, 429, bpeek)
+			return
+		}
+		log.Printf("[REQ %s] upstream 429 (throttle): %.300s", reqID, string(bpeek))
 		writeBodyWithType(w, resp, 429, bpeek)
 		return
 	}
@@ -951,6 +979,10 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 			writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
 			return
 		}
+	}
+	// 轮次计数：这条号又成功服务了一轮（429 日志里的 turns=N 用它）。
+	if resp.StatusCode == 200 {
+		poolNoteTurn(fp)
 	}
 	ir := newIdleTimeoutBody(resp.Body, streamIdle)
 	defer ir.Close()
@@ -1271,6 +1303,7 @@ func main() {
 
 	addr := ":" + env("PORT", "8080")
 	log.Printf("zen-direct %s listening %s upstream %s debug=%v concurrency=%d", appVersion, addr, upstream.String(), debugOn(), fwdConcurrency())
+	log.Printf("session policy: fresh-per-turn=%v (DIRECT_FRESH_PER_TURN; false = one session per conversation)", freshPerTurn())
 	log.Printf("timeouts: header=%ds first_byte=%ds idle=%ds",
 		int(headerTimeout().Seconds()), int(firstByteTimeout().Seconds()), int(streamIdleTimeout().Seconds()))
 	// WriteTimeout 不设：SSE 流可长达数分钟，写超时会掐正常流。

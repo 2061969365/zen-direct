@@ -38,7 +38,7 @@ bat 顶部 / ps1 `CONFIG` 区：
 | `LOG_KEEP_DAYS` | 7 | 过期日志自动删 |
 | `HIDE_WINDOW` | 1 | 0=显示窗口（排查） |
 | `OPENCODE_ZEN_BASE` | `https://opencode.ai/inference/v1` | 上游 base |
-| `DIRECT_FRESH_PER_TURN` | 1 | 1=每轮换新上游 session；0=一对话一号 |
+| `DIRECT_FRESH_PER_TURN` | 0（启动器）/ 1（代码） | 1=每轮换新上游 session；0=一对话一号（撞 429 才换） |
 | `DIRECT_FREELIMIT_COOLDOWN` | 到下个窗口重置 | 免费额度 429 后的冷却秒数（默认封到北京 07:59） |
 
 ## 会话与门禁（v0.7.0+：V2 配方）
@@ -73,8 +73,15 @@ bat 顶部 / ps1 `CONFIG` 区：
 启动时发现文件早于上次重置同样丢弃）。启动还会扫当天日志
 （`zen-direct-YYYYMMDD.err.log`，含 `.1`–`.3` 轮转片）里的
 `free-usage 429 ses=…`，把 id 收回毒库——进程被杀或名单被手工改过都不丢证据。
-默认每个对话每轮换一条新号（`DIRECT_FRESH_PER_TURN=1`），吃到 429 时记毒 +
-换号并封到下一个 07:59（换出口 IP 立即解封），不做当次重试。
+窗口重置清表之前，当天那批号会先追加进 `poison_archive.txt`（带
+`# window ended …` 日期头），日志留 7 天但归档常驻，每天毒了哪些号可查。
+默认**一对话一号**（启动器 `$FreshPerTurn = '0'`，代码默认 `1`）：吃到 429 时
+记毒 + 换号并封到下一个 07:59（换出口 IP 立即解封），不做当次重试；429 日志里
+带 `turns=N`（这条号在本次窗口内已经成功服务了几轮），用来量真实额度。
+
+429 兜底：认得出 `FreeUsageLimitError` → 记毒 + 全天冷却；明确是限流
+（`too many requests` / `rate limit`）→ 原样透传，不记毒；**认不出类型** →
+记毒 + 换号但不封全天（上游改措辞时不再赌）。
 
 旧注：此前误判为“白名单登记制”；实测证明纯结构判定（低 12 位），
 本地 descending 现签与本体无异。service/harvest/ACP 链保留作冗余，
