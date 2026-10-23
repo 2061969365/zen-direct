@@ -766,7 +766,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		}
 	}
 	log.Printf("[REQ %s] in=%s model=%s target=%s stream=%v official=%v fp=%s ses=%s new=%v upBytes=%d waitMs=%d",
-		reqID, entry, model, target, stream, official, shortStr(fp, 16), shortStr(poolSes, 20), isNewFP, len(upBody), waitMs)
+		reqID, entry, model, target, stream, official, shortStr(fp, 16), poolSes, isNewFP, len(upBody), waitMs)
 	if diagOn() && len(upBody) > 1<<20 {
 		var nItems int
 		if arr, ok := in["input"].([]any); ok {

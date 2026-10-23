@@ -1,0 +1,195 @@
+name: live-poison
+
+# 真上游实弹（会消耗免费额度，只在手动触发跑）。
+#
+# 两条 job 必须落在不同 runner 上：各拿一个独立出口 IP。用过一次打满额的
+# session 会把出口 IP 连坐 ≥45 分钟，所以「用毒号」这件事只能放在单独一台
+# 机器上，否则会把验证用的干净 IP 一起拖死。
+#
+# armed   ：池子里塞一条真·打满的 session（+ 毒名单同一条），同一对话连打 3 轮，
+#           要求 3 轮全 200、上游看到的 3 条 session 互不相同且都不是那条毒号。
+# control ：另一台 runner，先证明干净 IP 上现签号能 200，再用毒号直打上游，
+#           必须复现 429 FreeUsageLimitError —— 否则 armed 的通过毫无意义。
+on:
+  workflow_dispatch:
+
+jobs:
+  armed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Build
+        run: go build -trimpath -ldflags '-s -w' -o zen-direct-linux-amd64 .
+
+      - name: Seed the pool with a genuinely exhausted session
+        env:
+          POISON_SES: ${{ secrets.POISON_SES }}
+        run: |
+          set -euo pipefail
+          if [ -z "${POISON_SES:-}" ]; then echo "missing POISON_SES secret"; exit 1; fi
+          printf '%s\n' "$POISON_SES" > genuine.txt   # 池里只有这条毒号
+          printf '%s\n' "$POISON_SES" > poison.txt    # 毒名单也认它
+          echo "genuine=$(wc -l < genuine.txt) poison=$(wc -l < poison.txt)"
+
+      - name: Start gateway against the real upstream
+        run: |
+          set -euo pipefail
+          PORT=18080 \
+          OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1 \
+          SHIM_SESSION_FILE=/tmp/live-pool.json \
+          GENUINE_SESSION_FILE="$PWD/genuine.txt" \
+          DIRECT_POISON_FILE="$PWD/poison.txt" \
+          LOG_FILE="$PWD/gw.log" \
+          DIRECT_FREELIMIT_COOLDOWN=0 \
+          DIRECT_DEBUG=1 \
+          DIRECT_DIAG=1 \
+          nohup ./zen-direct-linux-amd64 > stderr.txt 2>&1 &
+          echo $! > gw.pid
+          for i in $(seq 1 40); do
+            sleep 1
+            if curl -sf -m 3 http://127.0.0.1:18080/health > health.json; then
+              echo "health: $(cat health.json)"
+              exit 0
+            fi
+          done
+          echo "gateway never became healthy"
+          cat stderr.txt || true
+          exit 1
+
+      - name: Three turns of one conversation
+        run: |
+          set -euo pipefail
+          for t in 1 2 3; do
+            body=$(printf '{"model":"deepseek-v4.1-flash-free","stream":false,"messages":[{"role":"user","content":"Answer with the single word: ok. attempt %s"}]}' "$t")
+            code=$(curl -s -m 180 -o "resp.$t" -w '%{http_code}' \
+              -X POST http://127.0.0.1:18080/v1/chat/completions \
+              -H 'Content-Type: application/json' \
+              -H 'X-Session-Id: ci-live-conv-1' \
+              -d "$body")
+            echo "--- turn $t -> HTTP $code"
+            head -c 300 "resp.$t"; echo
+            if [ "$code" != "200" ]; then
+              echo "turn $t did not answer 200"
+              exit 1
+            fi
+          done
+
+      - name: Assert fresh id per turn and no poisoned id
+        env:
+          POISON_SES: ${{ secrets.POISON_SES }}
+        run: |
+          set -euo pipefail
+          grep -o 'ses=[A-Za-z0-9_]*' gw.log | sed 's/^ses=//' | grep -v '^$' | sort -u > used.txt || true
+          echo "--- upstream sessions the gateway used ---"
+          cat used.txt
+          n=$(wc -l < used.txt | tr -d ' ')
+          if [ "$n" -ne 3 ]; then
+            echo "expected 3 distinct sessions for 3 turns, got $n"
+            exit 1
+          fi
+          if grep -qx "$POISON_SES" used.txt; then
+            echo "FAIL: the poisoned session was put on the wire"
+            exit 1
+          fi
+          if grep -q 'free-usage 429' gw.log; then
+            echo "FAIL: a free-limit 429 happened during the run"
+            exit 1
+          fi
+          echo "PASS: 3 turns, 3 distinct fresh sessions, poisoned id never used"
+
+      - name: Logs
+        if: always()
+        run: |
+          echo "--- gateway log ---"; tail -60 gw.log || true
+          echo "--- stderr ---"; tail -20 stderr.txt || true
+
+  control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Build
+        run: go build -trimpath -ldflags '-s -w' -o zen-direct-linux-amd64 .
+
+      - name: Clean IP + freshly minted id answers 200
+        run: |
+          set -euo pipefail
+          rm -f /tmp/c1-poison.txt
+          PORT=18081 \
+          OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1 \
+          SHIM_SESSION_FILE=/tmp/c1.json \
+          GENUINE_SESSION_FILE=/dev/null \
+          DIRECT_POISON_FILE=/tmp/c1-poison.txt \
+          LOG_FILE="$PWD/gw1.log" \
+          DIRECT_FREELIMIT_COOLDOWN=0 \
+          nohup ./zen-direct-linux-amd64 > stderr1.txt 2>&1 &
+          echo $! > gw1.pid
+          for i in $(seq 1 40); do
+            sleep 1
+            if curl -sf -m 3 http://127.0.0.1:18081/health > /dev/null; then break; fi
+          done
+          body='{"model":"deepseek-v4.1-flash-free","stream":false,"messages":[{"role":"user","content":"Answer with the single word: ok"}]}'
+          code=$(curl -s -m 180 -o resp_fresh -w '%{http_code}' \
+            -X POST http://127.0.0.1:18081/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -H 'X-Session-Id: ci-control-fresh' -d "$body")
+          echo "fresh -> HTTP $code"; head -c 300 resp_fresh; echo
+          kill "$(cat gw1.pid)" 2>/dev/null || true
+          if [ "$code" != "200" ]; then
+            echo "FAIL: a freshly minted session did not work from this runner"
+            tail -40 gw1.log || true
+            exit 1
+          fi
+
+      - name: The poisoned id still answers 429 today
+        env:
+          POISON_SES: ${{ secrets.POISON_SES }}
+        run: |
+          set -euo pipefail
+          if [ -z "${POISON_SES:-}" ]; then echo "missing POISON_SES secret"; exit 1; fi
+          printf '%s\n' "$POISON_SES" > genuine2.txt
+          rm -f /tmp/c2-poison.txt
+          PORT=18082 \
+          OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1 \
+          SHIM_SESSION_FILE=/tmp/c2.json \
+          GENUINE_SESSION_FILE="$PWD/genuine2.txt" \
+          DIRECT_POISON_FILE=/tmp/c2-poison.txt \
+          LOG_FILE="$PWD/gw2.log" \
+          DIRECT_FREELIMIT_COOLDOWN=0 \
+          nohup ./zen-direct-linux-amd64 > stderr2.txt 2>&1 &
+          echo $! > gw2.pid
+          for i in $(seq 1 40); do
+            sleep 1
+            if curl -sf -m 3 http://127.0.0.1:18082/health > /dev/null; then break; fi
+          done
+          body='{"model":"deepseek-v4.1-flash-free","stream":false,"messages":[{"role":"user","content":"Answer with the single word: ok"}]}'
+          code=$(curl -s -m 180 -o resp_poison -w '%{http_code}' \
+            -X POST http://127.0.0.1:18082/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -H 'X-Session-Id: ci-control-poison' -d "$body")
+          echo "poisoned -> HTTP $code"; head -c 300 resp_poison; echo
+          kill "$(cat gw2.pid)" 2>/dev/null || true
+          if [ "$code" != "429" ]; then
+            echo "FAIL: the id is no longer exhausted (stale POISON_SES?) - 'armed' proved nothing"
+            tail -40 gw2.log || true
+            exit 1
+          fi
+          if ! grep -q 'FreeUsageLimitError' resp_poison; then
+            echo "FAIL: 429 was not FreeUsageLimitError"
+            cat resp_poison
+            exit 1
+          fi
+          echo "PASS: poisoned id is genuinely dead today"
+
+      - name: Logs
+        if: always()
+        run: |
+          echo "--- gw1 ---"; tail -30 gw1.log 2>/dev/null || true
+          echo "--- gw2 ---"; tail -30 gw2.log 2>/dev/null || true
