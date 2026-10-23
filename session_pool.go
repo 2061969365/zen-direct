@@ -38,16 +38,86 @@ var (
 // badSesCap 烧号表上限：超了整表清零（误烧的 transient 迟早恢复，白名单重学）。
 const badSesCap = 2048
 
-// markBadSesLocked 记烧号。调用方须持 poolMu。
+// badSesFilePath 烧号名单路径：DIRECT_POISON_FILE 优先，缺省与会话池同目录。
+// 免费额度按上游 session 计且用完即永久 429（到窗口重置），重启后若从
+// genuine 名单里再捡回同一 id，等于把毒 session 重新请回来，故必须落盘。
+// badSesFile 单测覆盖用（resetPoolForTest 指到临时文件，不碰生产名单）。
+var badSesFile = ""
+
+func badSesFilePath() string {
+	if badSesFile != "" {
+		return badSesFile
+	}
+	if v := os.Getenv("DIRECT_POISON_FILE"); v != "" {
+		return v
+	}
+	return filepath.Join(filepath.Dir(poolFilePath()), "poisoned_sessions.txt")
+}
+
+// badSesLoad 启动时读烧号名单（poolLoad 内先于快照加载调用）。
+func badSesLoad() {
+	path := badSesFilePath()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[pool] poison load %s: %v", path, err)
+		}
+		return
+	}
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	n := 0
+	for _, ln := range strings.Split(string(b), "\n") {
+		s := strings.TrimSpace(ln)
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		if !badSes[s] {
+			badSes[s] = true
+			n++
+		}
+	}
+	if n > 0 {
+		log.Printf("[pool] loaded %d poisoned sessions from %s", n, path)
+	}
+}
+
+// badSesAppendLocked 追加一行到烧号名单。调用方须持 poolMu。
+// 上限触顶时整表清零并重写文件：误烧的 transient 迟早恢复，名单不能无限涨。
+func badSesAppendLocked(s string) {
+	path := badSesFilePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		log.Printf("[pool] poison mkdir: %v", err)
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		log.Printf("[pool] poison append %s: %v", path, err)
+		return
+	}
+	defer f.Close()
+	if _, err := f.WriteString(s + "\n"); err != nil {
+		log.Printf("[pool] poison write %s: %v", path, err)
+	}
+}
+
+// markBadSesLocked 记烧号（内存 + 落盘）。调用方须持 poolMu。
 func markBadSesLocked(s string) {
 	if s == "" {
+		return
+	}
+	if badSes[s] {
 		return
 	}
 	if len(badSes) >= badSesCap {
 		badSes = map[string]bool{}
 		log.Printf("[pool] bad-session table full, reset")
+		if err := os.Remove(badSesFilePath()); err != nil && !os.IsNotExist(err) {
+			log.Printf("[pool] poison reset %s: %v", badSesFilePath(), err)
+		}
 	}
 	badSes[s] = true
+	badSesAppendLocked(s)
 }
 
 type poolEntry struct {
@@ -396,6 +466,7 @@ func poolSave() {
 // 对应 fp 下次请求重借真 session。
 func poolLoad() {
 	genuineLoad()
+	badSesLoad()
 	path := poolFilePath()
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -439,6 +510,10 @@ func poolLoad() {
 	poolMap = map[string]*poolEntry{}
 	poolQ = nil
 	for _, kv := range all {
+		if badSes[kv.e.Session] {
+			// 额度已打尽的 session 不能随快照复活：再用一次就把出口 IP 拖下水。
+			continue
+		}
 		poolMap[kv.k] = kv.e
 		poolQ = append(poolQ, kv.k)
 	}
@@ -479,6 +554,11 @@ func resetPoolForTest() {
 	poolSaveSeq = 0
 	poolSavedSeq = 0
 	badSes = map[string]bool{}
+	freeLimitUntil.Store(0)
+	freeLimitDur.Store(0)
+	// 单测的烧号名单写到独立临时文件，绝不碰生产的 poisoned_sessions.txt。
+	badSesFile = filepath.Join(os.TempDir(), "zen-direct-test-poisoned.txt")
+	_ = os.Remove(badSesFile)
 	genuineSessions = nil
 	genuineSet = map[string]bool{}
 	// 单测永不拉真子进程/真服务：无 acp、无 service 也能跑，CI 也不慢。

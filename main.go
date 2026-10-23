@@ -18,8 +18,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -340,6 +342,78 @@ func isCallerMismatch(body []byte) bool {
 		strings.Contains(s, "was not issued")
 }
 
+// isFreeUsageLimit 上游 429 是否为“免费额度用尽”。
+// 该额度按上游 session 计（与出口 IP、对话内容无关）：同一个 session 打满后
+// 会一直 429 到窗口重置，换一个新 session 立刻恢复 200。
+func isFreeUsageLimit(body []byte) bool {
+	return bytes.Contains(body, []byte("FreeUsageLimitError")) ||
+		bytes.Contains(body, []byte("Free usage limit reached"))
+}
+
+// 免费额度 429 的 IP 连坐。实测（GitHub Actions，两台不同出口 IP）：
+//   - 用一个打满额度的 session -> 429；
+//   - 同一 IP 紧接着发全新 session（从未上游出现过）-> 也 429，
+//     0s / +60s / +120s 三次都是 429；
+//   - 对照 IP 只发全新 session，2 分钟内四次全 200。
+// 即额度按 session 计，但“碰一次毒 session”会把出口 IP 连坐数分钟。
+// 故吃了 free-limit 429 之后必须停手冷却：继续打只会把新 session 一起烧掉。
+var (
+	freeLimitUntil atomic.Int64 // 冷却截止（unix ms），0 = 未冷却
+	freeLimitCount atomic.Int64 // 累计 free-limit 429 次数（排障用）
+	freeLimitDur   atomic.Int64 // 当前冷却时长（ns），成功一次归零，再犯翻倍
+)
+
+const freeLimitDurCap = 40 * time.Minute
+
+// freeLimitCooldown 基础冷却时长，默认 10 分钟：实测连坐期 >5 分钟，
+// 本地复现是 16:11 中招、16:18 同 IP 新会话恢复（约 7 分钟）。
+// DIRECT_FREELIMIT_COOLDOWN 秒可调。
+func freeLimitCooldown() time.Duration {
+	if v := os.Getenv("DIRECT_FREELIMIT_COOLDOWN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 10 * time.Minute
+}
+
+// nextFreeLimitCooldown 冷却期内又中一次说明 IP 还没解禁：翻倍再等。
+// 连续成功后由 resetFreeLimitCooldown 归零。
+func nextFreeLimitCooldown() time.Duration {
+	base := int64(freeLimitCooldown())
+	cur := freeLimitDur.Load()
+	if cur == 0 {
+		cur = base
+	} else {
+		cur *= 2
+	}
+	if cur > int64(freeLimitDurCap) {
+		cur = int64(freeLimitDurCap)
+	}
+	freeLimitDur.Store(cur)
+	return time.Duration(cur)
+}
+
+// resetFreeLimitCooldown 上游 200 后清零升级档（下一个 429 从基础值起算）。
+func resetFreeLimitCooldown() {
+	if freeLimitDur.Load() != 0 {
+		freeLimitDur.Store(0)
+	}
+}
+
+// freeLimitBlocked 冷却剩余时间；未冷却返回 0,false。
+func freeLimitBlocked() (time.Duration, bool) {
+	until := freeLimitUntil.Load()
+	if until == 0 {
+		return 0, false
+	}
+	left := time.Until(time.UnixMilli(until))
+	if left <= 0 {
+		return 0, false
+	}
+	return left, true
+}
+
 // debugOn DIRECT_DEBUG=1 时转储 reasoning IDs + 上游体前 4KB。
 // 入口行（模型/会话/池/字节数）常驻一行，无需开关——单行成本，定位靠它。
 func debugOn() bool { return os.Getenv("DIRECT_DEBUG") == "1" }
@@ -420,10 +494,18 @@ func buildUpstream(entry Format, target Format, in map[string]any) map[string]an
 }
 
 // writeBodyWithType 透传已读的上游错误体（保留原 Content-Type）。
-func writeBodyWithType(w http.ResponseWriter, resp *http.Response, status int, b []byte) {	if ct := resp.Header.Get("Content-Type"); ct != "" {
+// 限流相关头一并转发：客户端靠 Retry-After / x-ratelimit-* 决定退避多久，
+// 吃掉这些头会让调用方立刻重试，反而把出口 IP 的连坐期拖长。
+func writeBodyWithType(w http.ResponseWriter, resp *http.Response, status int, b []byte) {
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	} else {
 		w.Header().Set("Content-Type", "application/json")
+	}
+	for _, h := range []string{"Retry-After", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", "X-RateLimit-Reset-After"} {
+		if v := resp.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
+		}
 	}
 	w.WriteHeader(status)
 	_, _ = w.Write(b)
@@ -659,6 +741,17 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	// 上游包体空闲超时：首字节后 stall 即掐（防半截流钉死 handler）。
 	// 超时直接 Close 上游体打断阻塞 Read（见 newIdleTimeoutBody）。
 	streamIdle := streamIdleTimeout()
+	// 免费层冷却：见过一次 free-limit 429 后，出口 IP 在数分钟内对任何 session
+	// 都 429，继续打只会把新 session 也烧了。直接回 429 + Retry-After，不打上游。
+	if apiKey == "public" || apiKey == "" {
+		if left, blocked := freeLimitBlocked(); blocked {
+			secs := int(left.Seconds()) + 1
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+			log.Printf("[REQ %s] free-limit cooldown, %ds left, short-circuit", reqID, secs)
+			writeErr(w, 429, "free_limit_cooldown", fmt.Sprintf("upstream free-tier quota exhausted; retry in %ds", secs))
+			return
+		}
+	}
 	resp, err := doUpstream(upSes, upBody)
 	// 传输层失败（建连即断，无响应字节）同请求重试一次：
 	// zen 经本地代理时对端 RST/EOF 是常态，重试一次多半就通；
@@ -684,6 +777,37 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 			writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
 			return
 		}
+	}
+	// 429 FreeUsageLimitError：免费额度按上游 session 计，打满后这条 session 会
+	// 一直 429 到窗口重置；且用它打一次，出口 IP 会被连坐数分钟（全新 session
+	// 也 429）。故这里不赌重试：记毒（落盘）+ 换 session + 进冷却，原样回 429。
+	// 旧逻辑对 429 一律透传且不换号，等于每次续聊都把毒 session 再喂一次，
+	// 复现“聊到一半整个网关全 429”。
+	if resp.StatusCode == 429 {
+		bpeek, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+		if isFreeUsageLimit(bpeek) {
+			cd := nextFreeLimitCooldown()
+			if cd > 0 {
+				freeLimitUntil.Store(time.Now().Add(cd).UnixMilli())
+			}
+			freeLimitCount.Add(1)
+			oldSes := upSes
+			poolMu.Lock()
+			markBadSesLocked(oldSes) // 落盘：重启后不再从 genuine 名单捡回来
+			poolMu.Unlock()
+			if usePool && fp != "" {
+				poolSes, _ = poolRotate(fp) // 下一次请求用干净 session
+				upSes = poolSes
+			}
+			log.Printf("[REQ %s] free-usage 429 ses=%s, poisoned+rotate, cooldown %s (total=%d)",
+				reqID, shortStr(oldSes, 20), cd, freeLimitCount.Load())
+			writeBodyWithType(w, resp, 429, bpeek)
+			return
+		}
+		log.Printf("[REQ %s] upstream 429 (not free-limit): %.300s", reqID, string(bpeek))
+		writeBodyWithType(w, resp, 429, bpeek)
+		return
 	}
 	// caller-mismatch 400 自愈（仅 responses 入口 + 池 lineage + 一次）：
 	// 池命中时首轮 strip 被跳过，历史里混着跨 key 毒串必 400；
@@ -719,7 +843,8 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		}
 	}
 	// 上游 502/503 瞬时抖：退避重发一次（写下游字节前，流/非流皆安全）。
-	// 500 不碰（模型真失败，重试纯烧钱）；429 不碰（限流越冲越死）。
+	// 500 不碰（模型真失败，重试纯烧钱）；429 只走上面的换 session 分支
+	// （同 session 硬冲越冲越死），到这里说明轮换后仍非 200，不再重试。
 	// 注意：自愈分支的 400 重试若撞上 502/503，会落到这里再重试一次（最多 3 次上游调用）。
 	if resp.StatusCode == 502 || resp.StatusCode == 503 {
 		log.Printf("[REQ %s] upstream %d flaky, backoff retry once", reqID, resp.StatusCode)
@@ -755,7 +880,8 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		_, _ = w.Write(b)
 		return
 	}
-	cbRecord(200) // 上游受理（流式以响应头 200 为准，中途截断不影响受理计数）。
+	resetFreeLimitCooldown() // 通了：下一次免费额度 429 从基础冷却重新起算
+	cbRecord(200)            // 上游受理（流式以响应头 200 为准，中途截断不影响受理计数）。
 	if stream {
 		// 同格式 responses 直传；跨格式走转换（DONE 语义由各转换函数保证）。
 		if entry == FmtResponses && target == FmtResponses {
