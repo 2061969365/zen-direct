@@ -1,0 +1,32 @@
+name: cli-state
+
+# 找 opencode CLI 把 session id / project id 存在哪里。
+on:
+  workflow_dispatch:
+
+jobs:
+  state:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: install opencode CLI
+        run: |
+          npm install -g @opencode/cli@latest 2>&1 | tail -1
+          opencode --version
+      - name: run once then dump state
+        run: |
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export OPENCODE_DISABLE_AUTOUPDATE=1
+          opencode run -m opencode/deepseek-v4.1-flash-free "Reply with the single word: ok" >/tmp/out.txt 2>/tmp/err.txt || true
+          echo "out: $(cat /tmp/out.txt)"
+          echo "--- dirs ---"
+          ls -la "$HOME/.local/share/opencode" 2>/dev/null || echo "no local share"
+          ls -la "$HOME/.config/opencode" 2>/dev/null || echo "no config"
+          echo "--- files ---"
+          find "$HOME/.local/share/opencode" "$HOME/.config/opencode" -maxdepth 3 -type f 2>/dev/null | head -40
+          echo "--- session ids in state ---"
+          grep -rhoE 'ses_[0-9A-Za-z]{20,}' "$HOME/.local/share/opencode" "$HOME/.config/opencode" 2>/dev/null | sort -u | head -10 || true
+          echo "--- project-ish values ---"
+          grep -rhoE '"project[^,}]{0,80}' "$HOME/.local/share/opencode" "$HOME/.config/opencode" 2>/dev/null | head -10 || true
+          echo "--- db files ---"
+          find "$HOME/.local/share/opencode" -name '*.db' -o -name '*.sqlite*' -o -name '*.json' 2>/dev/null | head -20
