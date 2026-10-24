@@ -110,6 +110,7 @@ def handle(c):
                 break
             data += d
         print("HELLO " + parse_hello(data), flush=True)
+        print("HELLO_HEX " + binascii.hexlify(data).decode(), flush=True)
         s = socket.create_connection((REAL_IP, 443), timeout=15)
         s.sendall(data)
         threading.Thread(target=pipe, args=(c, s), daemon=True).start()

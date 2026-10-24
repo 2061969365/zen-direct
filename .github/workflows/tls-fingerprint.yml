@@ -11,9 +11,15 @@ name: tls-fingerprint
 
 on:
   workflow_dispatch:
+    inputs:
+      only:
+        description: "capture = 只跑指纹抓取；空 = 全跑"
+        required: false
+        default: ""
 
 jobs:
   capture:
+    if: ${{ github.event.inputs.only == '' || github.event.inputs.only == 'capture' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -47,6 +53,7 @@ jobs:
           cat /tmp/relay.log
 
   utls:
+    if: ${{ github.event.inputs.only == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     strategy:
