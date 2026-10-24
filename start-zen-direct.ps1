@@ -15,6 +15,13 @@ $ZenBase     = 'https://opencode.ai/inference/v1'  # 上游 base（V2）
 # 换号策略：0=一对话一号（撞 429 才换） 1=每轮新号
 $FreshPerTurn = '0'
 $PoolFile    = $null
+# 上游传输 sidecar（Bun fetch）。2026-10-24 起上游免费层只认 opencode CLI 的
+# 传输指纹 + 官方 system 提示词；Go 直连必 429。'off' = 直连（仅排障用）。
+$SidecarPort = '19200'
+# 空 = 自动找 PATH / %USERPROFILE%\.bun\bin\bun.exe
+$BunPath     = ''
+# 空 = 继承当前环境变量；填 http://127.0.0.1:10809 可显式指定 sidecar 的代理
+$UpstreamProxy = ''
 # =========================================================
 
 $home_   = $PSScriptRoot
@@ -99,6 +106,67 @@ try {
 }
 
 $winStyle = if ($HideWindow) { 'Hidden' } else { 'Normal' }
+
+# ===================== upstream sidecar (Bun fetch) =====================
+# 上游只认 opencode CLI 的传输指纹 + 官方 system 提示词；Go 直连必 429。
+# sidecar 用 Bun fetch 转发，并在 messages[0] 注入官方提示词。
+$sidecarScript = Join-Path $home_ 'zen_sidecar.js'
+if ("$SidecarPort" -ne 'off' -and (Test-Path $sidecarScript)) {
+  $bun = $BunPath
+  if (-not $bun) {
+    $cmd = Get-Command bun -ErrorAction SilentlyContinue
+    if ($cmd) {
+      $src = $cmd.Source
+      if ($src -like '*.exe') {
+        $bun = $src
+      } elseif ($src) {
+        # npm 的 bun.ps1/.cmd 是壳，真正可执行文件在 node_modules\bun\bin
+        $cand = Join-Path (Split-Path $src) 'node_modules\bun\bin\bun.exe'
+        if (Test-Path $cand) { $bun = $cand }
+      }
+    }
+  }
+  if (-not $bun) {
+    $cand = Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
+    if (Test-Path $cand) { $bun = $cand }
+  }
+  if (-not $bun) {
+    Write-Host 'sidecar: bun not found -> direct upstream (will 429)'
+  } else {
+    Get-CimInstance Win32_Process -Filter "Name='bun.exe'" -ErrorAction SilentlyContinue |
+      Where-Object { $_.CommandLine -like '*zen_sidecar.js*' } |
+      ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} }
+    Start-Sleep 1
+
+    $env:ZEN_SIDECAR_PORT = "$SidecarPort"
+    if ($UpstreamProxy) {
+      $env:HTTPS_PROXY = $UpstreamProxy
+      $env:HTTP_PROXY  = $UpstreamProxy
+    }
+    $scOut = Join-Path $home_ ('sidecar-{0}.out.log' -f (Get-Date -Format 'yyyyMMdd'))
+    $scErr = Join-Path $home_ ('sidecar-{0}.err.log' -f (Get-Date -Format 'yyyyMMdd'))
+    Start-Process -FilePath $bun -ArgumentList @("`"$sidecarScript`"") -WindowStyle Hidden `
+      -RedirectStandardOutput $scOut -RedirectStandardError $scErr
+
+    $sidecarOk = $false
+    for ($i = 0; $i -lt 40; $i++) {
+      Start-Sleep -Milliseconds 250
+      $h = curl.exe -s -m 2 "http://127.0.0.1:$SidecarPort/health" 2>$null
+      if ($h -match '"status":"ok"') { $sidecarOk = $true; break }
+    }
+    if ($sidecarOk) {
+      $env:OPENCODE_ZEN_BASE = "http://127.0.0.1:$SidecarPort/inference/v1"
+      Write-Host "sidecar: $h"
+    } else {
+      Write-Host "sidecar: start failed -> direct upstream (will 429); see $scErr"
+    }
+  }
+} elseif ("$SidecarPort" -eq 'off') {
+  Write-Host 'sidecar: disabled (SidecarPort=off) -> direct upstream (will 429)'
+} else {
+  Write-Host "sidecar: missing $sidecarScript -> direct upstream (will 429)"
+}
+
 Start-Process -FilePath $exe -WindowStyle $winStyle
 Start-Sleep 2
 

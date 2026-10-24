@@ -25,6 +25,8 @@ REM                 1 = a fresh upstream session on every turn
 set "DIRECT_FRESH_PER_TURN=0"
 REM upstream base URL (V2)
 set "OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1"
+REM upstream transport sidecar (Bun fetch). off = direct (will 429)
+set "SIDECAR_PORT=19200"
 REM ------------------------------------------------------------------------
 
 set "HOME_DIR=%~dp0"
@@ -77,6 +79,23 @@ REM opencode; minted ses always 403). Best-effort, never blocks startup.
 where python >nul 2>&1
 if %ERRORLEVEL%==0 (
   python "%HOME_DIR%\harvest_genuine.py" "%HOME_DIR%\genuine_sessions.txt"
+)
+
+REM --- upstream sidecar (Bun fetch + official system prompt) ---
+REM 上游免费层只认 opencode CLI 的传输指纹；Go 直连必 429。
+if /i not "%SIDECAR_PORT%"=="off" if exist "%HOME_DIR%\zen_sidecar.js" (
+  set "BUN_EXE="
+  for /f "delims=" %%b in ('powershell -NoProfile -Command "$c=Get-Command bun -EA SilentlyContinue; if($c){ $s=$c.Source; if($s -like '*.exe'){ $s } else { $p=Join-Path (Split-Path $s) 'node_modules\bun\bin\bun.exe'; if(Test-Path $p){ $p } } }"') do set "BUN_EXE=%%b"
+  if defined BUN_EXE (
+    powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='bun.exe'\" -EA SilentlyContinue | Where-Object { $_.CommandLine -like '*zen_sidecar.js*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }" >nul 2>&1
+    set "ZEN_SIDECAR_PORT=%SIDECAR_PORT%"
+    powershell -NoProfile -Command "Start-Process -FilePath '%BUN_EXE%' -ArgumentList '\"%HOME_DIR%\zen_sidecar.js\"' -WindowStyle Hidden -RedirectStandardOutput '%HOME_DIR%\sidecar-%DATESTAMP%.out.log' -RedirectStandardError '%HOME_DIR%\sidecar-%DATESTAMP%.err.log'" >nul 2>&1
+    timeout /t 2 /nobreak >nul
+    set "OPENCODE_ZEN_BASE=http://127.0.0.1:%SIDECAR_PORT%/inference/v1"
+    echo sidecar: http://127.0.0.1:%SIDECAR_PORT%
+  ) else (
+    echo sidecar: bun not found -^> direct upstream ^(will 429^)
+  )
 )
 
 if "%HIDE_WINDOW%"=="1" (

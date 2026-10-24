@@ -168,3 +168,26 @@ harness 见 failed 帧可安全重试（本轮内容由重试无损拿回）。
 4. `GET /health` 探活并打印日志尾部
 
 日志：`zen-direct-YYYYMMDD.err.log`（按天分文件，网关内 50MB×4 轮转 + 脚本按总量兜底）。
+
+## 上游传输 sidecar（2026-10-24）
+
+上游免费层现在按**客户端指纹**发额度，不是按 session：
+
+- 传输层必须是 Bun `fetch`（opencode CLI 的运行时）；Go / Python / Node / Bun 的 `node:https` 一律 `FreeUsageLimitError`。
+- 请求体 `messages[0]` 必须是 OpenCode 官方 system 提示词；否则同样 429。
+- 满足这两条后，工具集、用户提示词、session id 都可以保持原样。
+
+启动器会先拉起 `zen_sidecar.js`（Bun，默认 127.0.0.1:19200），并把
+`OPENCODE_ZEN_BASE` 指向它：
+
+    网关 :8081 -> sidecar :19200 (Bun fetch + 官方提示词) -> opencode.ai
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `SidecarPort` / `SIDECAR_PORT` | 19200 | `off` = 直连（仅排障，会 429） |
+| `BunPath` | 空 | 空=自动找 PATH / npm 的 bun.exe |
+| `UpstreamProxy` | 空 | 空=继承环境；可填 `http://127.0.0.1:10809` |
+
+sidecar 日志：`sidecar-YYYYMMDD.out.log` / `.err.log`，每行含 `inject=1` 与上游状态。
+
+复现实验：`.github/workflows/sidecar-e2e.yml`、`shape-final.yml`、`transport-fingerprint.yml`。
