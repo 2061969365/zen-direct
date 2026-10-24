@@ -1,0 +1,118 @@
+name: project-bucket
+
+# 假设：免费额度按 x-opencode-project 分桶，网关硬编码的 "global" 是共享桶，已被榨干。
+# 同一台 runner、同一个 IP 上：
+#   CLI 控制组（判断这个 IP 是否干净）
+#   GW-proj  ：OPENCODE_ZEN_PROJECT=<随机 40 位 hex>
+#   GW-global：默认 global
+#   GW-override：客户端自带 X-Opencode-Project 头覆盖 global
+# 判定：proj 200 + global 429 → 根因是 project 桶。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  buckets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: install opencode CLI
+        run: |
+          npm install -g @opencode/cli@latest 2>&1 | tail -1
+          opencode --version
+      - name: egress IP
+        run: curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; j=json.load(sys.stdin); print(j["query"], j["city"])'
+      - name: project bucket A/B
+        run: |
+          set -u
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export OPENCODE_DISABLE_AUTOUPDATE=1
+          W="$PWD/_pb"; mkdir -p "$W"
+          go build -trimpath -o zen-direct .
+
+          echo "=== control: real CLI (is this IP clean?) ==="
+          set +e
+          timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free \
+            "Reply with the single word: ok" >"$W/cli.out" 2>"$W/cli.err"
+          echo "cli_exit=$?"
+          set -e
+          tail -2 "$W/cli.out"; tail -3 "$W/cli.err"
+
+          PROJ=$(python3 -c 'import hashlib,os; print(hashlib.sha1(os.urandom(16)).hexdigest())')
+          PROJ2=$(python3 -c 'import hashlib,os; print(hashlib.sha1(os.urandom(16)).hexdigest())')
+          echo "random project ids: $PROJ / $PROJ2"
+
+          start_gw() {  # $1=port $2=project ("" = default global)
+            local port=$1 proj=$2 dir=$W/gw$1
+            mkdir -p "$dir"; : > "$dir/genuine.txt"
+            if [ -n "$proj" ]; then
+              nohup env PORT=$port OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1 \
+                DIRECT_FRESH_PER_TURN=0 DIRECT_DEBUG=1 DIRECT_DIAG=1 \
+                OPENCODE_ZEN_PROJECT="$proj" \
+                LOG_FILE="$dir/gw.log" SHIM_SESSION_FILE="$dir/shim.json" \
+                DIRECT_POISON_FILE="$dir/poison.txt" GENUINE_SESSION_FILE="$dir/genuine.txt" \
+                ./zen-direct >"$dir/gw.err" 2>&1 &
+            else
+              nohup env PORT=$port OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1 \
+                DIRECT_FRESH_PER_TURN=0 DIRECT_DEBUG=1 DIRECT_DIAG=1 \
+                LOG_FILE="$dir/gw.log" SHIM_SESSION_FILE="$dir/shim.json" \
+                DIRECT_POISON_FILE="$dir/poison.txt" GENUINE_SESSION_FILE="$dir/genuine.txt" \
+                ./zen-direct >"$dir/gw.err" 2>&1 &
+            fi
+            for i in $(seq 1 60); do
+              curl -sf -m 2 http://127.0.0.1:$port/health >/dev/null 2>&1 && break
+              sleep 0.3
+            done
+          }
+
+          start_gw 18081 "$PROJ"     # random project
+          start_gw 18082 ""          # default global
+
+          cat > "$W/post.py" <<'PY'
+          import json, sys, urllib.request, urllib.error
+          port, tag, text = sys.argv[1], sys.argv[2], sys.argv[3]
+          extra = sys.argv[4] if len(sys.argv) > 4 else ""
+          body = json.dumps({"model": "deepseek-v4.1-flash-free", "stream": False,
+                             "messages": [{"role": "system", "content": "You are an AI agent powered by DeepSeek Harness."},
+                                          {"role": "user", "content": text}]}).encode()
+          req = urllib.request.Request("http://127.0.0.1:%s/v1/chat/completions" % port,
+                                       data=body, method="POST")
+          req.add_header("Content-Type", "application/json")
+          if extra:
+              req.add_header("X-Opencode-Project", extra)
+          try:
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  print("%s -> %s %r" % (tag, r.status, r.read(100)[:100]))
+          except urllib.error.HTTPError as e:
+              print("%s -> %s %r retry-after=%s" % (tag, e.code, e.read(160)[:160],
+                                                    e.headers.get("Retry-After")))
+          except Exception as e:
+              print("%s -> ERR %s" % (tag, e))
+          PY
+
+          echo "=== gateway A/B ==="
+          python3 "$W/post.py" 18081 "GW-proj-1"     "project bucket check 1"
+          sleep 2
+          python3 "$W/post.py" 18082 "GW-global-1"   "project bucket check 2"
+          sleep 2
+          python3 "$W/post.py" 18081 "GW-proj-2"     "project bucket check 3"
+          sleep 2
+          python3 "$W/post.py" 18082 "GW-override"   "project bucket check 4" "$PROJ2"
+          sleep 2
+          python3 "$W/post.py" 18082 "GW-global-2"   "project bucket check 5"
+
+          echo "=== logs ==="
+          for p in 18081 18082; do
+            echo "--- port $p ---"
+            grep -E '\[REQ|free-usage' "$W/gw$p/gw.log" | sed -E 's/ debug upBody.*//' | tail -8
+          done
+          pkill -f 'zen-direct' || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: project-bucket
+          path: _pb
