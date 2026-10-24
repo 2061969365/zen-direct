@@ -53,13 +53,13 @@ jobs:
           cat /tmp/relay.log
 
   utls:
-    if: ${{ github.event.inputs.only == '' }}
+    if: ${{ github.event.inputs.only == '' || github.event.inputs.only == 'utls' }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     strategy:
       fail-fast: false
       matrix:
-        variant: [chrome-h1, chrome-h2, firefox-h1, safari-h1]
+        variant: [bun-h2, bun-h1, chrome-h2, chrome-h1]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -102,3 +102,4 @@ jobs:
         with:
           name: tls-${{ matrix.variant }}
           path: _tls
+
