@@ -1,0 +1,100 @@
+name: sidecar-fix
+
+# 验证修复：网关 -> 本地 Bun sidecar（fetch）-> 上游。
+#   CLI 控制组（判断 IP 干净）
+#   GW-A1 / GW-B1 两个不同对话（应各自 200，且 session 不同）
+#   GW-A2 续聊（应复用 A 的 session）
+on:
+  workflow_dispatch:
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: install opencode CLI
+        run: |
+          npm install -g @opencode/cli@latest 2>&1 | tail -1
+          opencode --version
+      - name: install bun
+        run: |
+          curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1 || true
+          "$HOME/.bun/bin/bun" --version || echo "no bun"
+      - name: shard ${{ matrix.shard }}
+        run: |
+          set -u
+          export PATH="$HOME/.npm-global/bin:$HOME/.bun/bin:$PATH"
+          export OPENCODE_DISABLE_AUTOUPDATE=1
+          W="$PWD/_fx"; mkdir -p "$W"
+          go build -trimpath -o zen-direct .
+          IP=$(curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["query"])')
+          echo "shard=${{ matrix.shard }} ip=$IP"
+
+          set +e
+          timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free \
+            "Reply with the single word: ok" >"$W/c0.out" 2>"$W/c0.err"
+          C0=$?
+          set -e
+          echo "C0 exit=$C0 out=$(tail -1 "$W/c0.out")"
+          if [ "$C0" != "0" ]; then echo "SHARD ${{ matrix.shard }} IP=$IP DIRTY"; exit 0; fi
+          echo "SHARD ${{ matrix.shard }} IP=$IP CLEAN"
+
+          nohup "$HOME/.bun/bin/bun" tools/bun_sidecar.js 19200 >"$W/sidecar.log" 2>&1 &
+          sleep 1
+          cat "$W/sidecar.log"
+          curl -s -o /dev/null -w "sidecar probe: %{http_code}\n" -m 5 http://127.0.0.1:19200/inference/v1/models || true
+
+          mkdir -p "$W/gw"; : > "$W/gw/genuine.txt"
+          nohup env PORT=18081 OPENCODE_ZEN_BASE=http://127.0.0.1:19200/inference/v1 \
+            DIRECT_FRESH_PER_TURN=0 DIRECT_DEBUG=1 DIRECT_DIAG=1 SVC_OFF=1 \
+            LOG_FILE="$W/gw/gw.log" SHIM_SESSION_FILE="$W/gw/shim.json" \
+            DIRECT_POISON_FILE="$W/gw/poison.txt" GENUINE_SESSION_FILE="$W/gw/genuine.txt" \
+            ./zen-direct >"$W/gw/gw.err" 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf -m 2 http://127.0.0.1:18081/health >/dev/null 2>&1 && break
+            sleep 0.3
+          done
+
+          cat > "$W/post.py" <<'PY'
+          import json, sys, time, urllib.request, urllib.error
+          tag, text = sys.argv[1], sys.argv[2]
+          body = json.dumps({"model": "deepseek-v4.1-flash-free", "stream": False,
+                             "messages": [{"role": "system", "content": "You are an AI agent powered by DeepSeek Harness."},
+                                          {"role": "user", "content": text}]}).encode()
+          req = urllib.request.Request("http://127.0.0.1:18081/v1/chat/completions", data=body, method="POST")
+          req.add_header("Content-Type", "application/json")
+          t0 = time.time()
+          try:
+              with urllib.request.urlopen(req, timeout=180) as r:
+                  print("%s -> %s %.1fs %r" % (tag, r.status, time.time()-t0, r.read(120)[:120]))
+          except urllib.error.HTTPError as e:
+              print("%s -> %s %.1fs %r retry-after=%s" % (tag, e.code, time.time()-t0,
+                                                          e.read(160)[:160], e.headers.get("Retry-After")))
+          except Exception as e:
+              print("%s -> ERR %s" % (tag, e))
+          PY
+
+          python3 "$W/post.py" "GW-A1" "sidecar alpha 11"
+          sleep 2
+          python3 "$W/post.py" "GW-B1" "sidecar beta 22"
+          sleep 2
+          python3 "$W/post.py" "GW-A2" "sidecar alpha 11 follow up"
+          sleep 1
+          echo "=== gateway log ==="
+          grep -E '\[REQ|free-usage' "$W/gw/gw.log" | sed -E 's/ debug upBody.*//' | tail -10
+          echo "=== sidecar log ==="
+          tail -5 "$W/sidecar.log"
+          pkill -f 'zen-direct' || true; pkill -f bun_sidecar || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fix-${{ matrix.shard }}
+          path: _fx
