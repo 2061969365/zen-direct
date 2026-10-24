@@ -92,6 +92,8 @@ class Handler(BaseHTTPRequestHandler):
                 if k.lower() in DROP_REQ:
                     continue
                 conn.putheader(k, v)
+            # skip_host=True 关掉了自动 Host，必须自己补，否则上游 400。
+            conn.putheader("Host", UPSTREAM_HOST)
             conn.putheader("Content-Length", str(len(body)))
             conn.endheaders()
             if body:

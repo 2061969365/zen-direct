@@ -36,12 +36,15 @@ jobs:
           cat "$W/proxy.log"
 
           echo "=== CLI through the capture proxy ==="
+          set +e
           OPENCODE_CONFIG_CONTENT='{"provider":{"opencode":{"options":{"baseURL":"http://127.0.0.1:19100/inference/v1"}}}}' \
             timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free \
             "Reply with the single word: ok" >"$W/cli.out" 2>"$W/cli.err"
-          echo "cli_exit=$?"
+          CLI_EXIT=$?
+          set -e
+          echo "cli_exit=$CLI_EXIT"
           tail -3 "$W/cli.out"
-          grep -Ei 'error|429|limit' "$W/cli.err" | tail -5 || true
+          tail -6 "$W/cli.err"
 
           echo "=== gateway through the same capture proxy ==="
           : > "$W/genuine.txt"
