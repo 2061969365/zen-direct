@@ -1,0 +1,108 @@
+name: shape-bisect
+
+# Bun 传输下，现签 session，逐项找最小可行形状：
+#   X1 DSH 提示词 + 12 工具 + max_completion_tokens=32000
+#   X2 官方提示词 + DSH 用户消息 + 12 工具（无 max tokens）
+#   X3 官方提示词 + DSH 提示词（两条 system）+ 12 工具 + max tokens
+# 目的：决定 sidecar 要不要改提示词。
+on:
+  workflow_dispatch:
+
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: install opencode CLI
+        run: |
+          npm install -g @opencode/cli@latest 2>&1 | tail -1
+          opencode --version
+      - name: install bun
+        run: |
+          curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1 || true
+          "$HOME/.bun/bin/bun" --version || echo "no bun"
+      - name: shard ${{ matrix.shard }}
+        run: |
+          set -u
+          export PATH="$HOME/.npm-global/bin:$HOME/.bun/bin:$PATH"
+          export OPENCODE_DISABLE_AUTOUPDATE=1
+          W="$PWD/_sb"; mkdir -p "$W"
+          IP=$(curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["query"])')
+          echo "shard=${{ matrix.shard }} ip=$IP"
+
+          set +e
+          timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free \
+            "Reply with the single word: ok" >"$W/c0.out" 2>"$W/c0.err"
+          C0=$?
+          set -e
+          echo "C0 exit=$C0 out=$(tail -1 "$W/c0.out")"
+          if [ "$C0" != "0" ]; then echo "SHARD ${{ matrix.shard }} IP=$IP DIRTY"; exit 0; fi
+          echo "SHARD ${{ matrix.shard }} IP=$IP CLEAN"
+
+          cat > "$W/x.js" <<'JS'
+          const fs = require("fs");
+          const cli = JSON.parse(fs.readFileSync("tools/cli_capture_body.json").toString());
+          const OFFICIAL = cli.messages[0].content;
+          const DSH = "You are an AI agent powered by DeepSeek Harness.\n\nYou are a coding agent.";
+          const USER = "shape bisect check";
+          function mint() {
+            const ts = BigInt(Date.now());
+            const n = ~((ts << 12n) + 1n) & ((1n << 64n) - 1n);
+            const hx = "0123456789abcdef";
+            let s = "ses_";
+            for (let i = 0; i < 6; i++) {
+              const b = Number((n >> BigInt(40 - 8 * i)) & 0xffn);
+              s += hx[b >> 4] + hx[b & 0xf];
+            }
+            const al = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+            for (let i = 0; i < 14; i++) s += al[Math.floor(Math.random() * al.length)];
+            return s;
+          }
+          const url = "https://opencode.ai/inference/v1/chat/completions";
+          async function send(tag, body) {
+            const ses = mint();
+            const headers = {
+              "Authorization": "Bearer public",
+              "Content-Type": "application/json",
+              "User-Agent": "opencode/latest/2.0.29/cli",
+              "X-Opencode-Client": "cli",
+              "X-Opencode-Project": "global",
+              "X-Opencode-Session": ses,
+              "X-Opencode-Session-Id": ses,
+              "X-Session-Affinity": ses,
+              "X-Session-Id": ses,
+            };
+            const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+            const t = await r.text();
+            console.log(tag, "->", r.status, JSON.stringify(t.slice(0, 110)));
+          }
+          const base = {
+            model: "deepseek-v4.1-flash-free",
+            stream: true,
+            stream_options: { include_usage: true },
+            tools: cli.tools,
+          };
+          await send("X1 dsh+12tools+max", Object.assign({}, base, {
+            messages: [{ role: "system", content: DSH }, { role: "user", content: USER }],
+            max_completion_tokens: 32000,
+          }));
+          await send("X2 official+12tools", Object.assign({}, base, {
+            messages: [{ role: "system", content: OFFICIAL }, { role: "user", content: USER }],
+          }));
+          await send("X3 official+dsh+12tools+max", Object.assign({}, base, {
+            messages: [{ role: "system", content: OFFICIAL }, { role: "system", content: DSH },
+                       { role: "user", content: USER }],
+            max_completion_tokens: 32000,
+          }));
+          JS
+          "$HOME/.bun/bin/bun" "$W/x.js" || echo "bun failed"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sb-${{ matrix.shard }}
+          path: _sb
