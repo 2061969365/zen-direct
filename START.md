@@ -177,10 +177,34 @@ harness 见 failed 帧可安全重试（本轮内容由重试无损拿回）。
 - 请求体 `messages[0]` 必须是 OpenCode 官方 system 提示词；否则同样 429。
 - 满足这两条后，工具集、用户提示词、session id 都可以保持原样。
 
-启动器会先拉起 `zen_sidecar.js`（Bun，默认 127.0.0.1:19200），并把
-`OPENCODE_ZEN_BASE` 指向它：
+### v0.8.0+：内嵌 sidecar（一个 exe）
 
-    网关 :8081 -> sidecar :19200 (Bun fetch + 官方提示词) -> opencode.ai
+`zen_sidecar.js` 与官方提示词用 `//go:embed` 编进 `zen-direct.exe`，启动时释放到
+`%LOCALAPPDATA%\zen-direct\sidecar\`，由网关自己 `spawn bun`、等 `/health`、把上游
+指过去。发布物只有一个 exe，唯一外部依赖是本机装了 Bun。
+
+    客户端 :8081 -> zen-direct.exe -> 127.0.0.1:<随机端口> (bun zen_sidecar.js) -> opencode.ai
+
+- 端口：默认每次启动挑空闲端口；`ZEN_SIDECAR_PORT` 可固定。
+- 托管：bun 退出后指数退避重启（1s→30s 封顶），网关退出时收掉；网关被强杀时
+  bun 靠 120s 无心跳自杀，不留孤儿。
+- 观测：`GET /health` 里的 `sidecar` 字段（state/pid/port/restarts/last_error）；
+  bun 的输出并入网关日志，行首 `bun|`，可看到 `inject=1 ... -> 200`。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `DIRECT_SIDECAR` | `auto` | `off` = 直连（仅排障，会 429） |
+| `ZEN_BUN` | 空 | 空=自动找 PATH / `%USERPROFILE%\.bun` / npm 的 `bun.exe` |
+| `ZEN_SIDECAR_PORT` | 空 | 空=自动挑空闲端口 |
+| `ZEN_SIDECAR_DIR` | `%LOCALAPPDATA%\zen-direct\sidecar` | 释放目录 |
+| `OPENCODE_ZEN_BASE` | `https://opencode.ai/inference/v1` | 远端上游；指向 loopback 时视为外部 sidecar，不再内嵌 |
+| `DIRECT_SIDECAR_STRIP_PROMPT` | 空 | `1` = 不注入官方提示词（A/B 复现） |
+
+### v0.7.x：外挂 sidecar（历史）
+
+早期由启动器先拉起 `zen_sidecar.js`（Bun，默认 127.0.0.1:19200），再把
+`OPENCODE_ZEN_BASE` 指向它。行为等价，只是多一个进程要自己管；启动器已改成交给 exe，
+旧版启动器留下的 `bun.exe` 会在下次启动时被清掉。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -188,6 +212,6 @@ harness 见 failed 帧可安全重试（本轮内容由重试无损拿回）。
 | `BunPath` | 空 | 空=自动找 PATH / npm 的 bun.exe |
 | `UpstreamProxy` | 空 | 空=继承环境；可填 `http://127.0.0.1:10809` |
 
-sidecar 日志：`sidecar-YYYYMMDD.out.log` / `.err.log`，每行含 `inject=1` 与上游状态。
+sidecar 日志（外挂模式）：`sidecar-YYYYMMDD.out.log` / `.err.log`，每行含 `inject=1` 与上游状态。
 
 复现实验：`.github/workflows/sidecar-e2e.yml`、`shape-final.yml`、`transport-fingerprint.yml`。

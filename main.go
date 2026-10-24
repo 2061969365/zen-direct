@@ -16,12 +16,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -33,6 +35,7 @@ var zenUA = func() string {
 	}
 	return "opencode/latest/2.0.29/cli"
 }()
+
 const mintChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 const mintHex = "0123456789abcdef"
 
@@ -1287,12 +1290,9 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int
 
 func main() {
 	var err error
-	upstream, err = url.Parse(env("OPENCODE_ZEN_BASE", "https://opencode.ai/inference/v1"))
-	if err != nil {
-		log.Fatalf("OPENCODE_ZEN_BASE 非法: %v", err)
-	}
 	// 网关自管日志文件：LOG_FILE 设路径即启用，按 LOG_MAX_MB（默认 200）总量轮转；
 	// 未设则沿用 stderr（旧行为）。自管后不再依赖外部重定向，Hidden 启动不丢日志。
+	// 放在 sidecar 之前：bun 的 stdout/stderr 要并进同一个日志。
 	if lp := env("LOG_FILE", ""); lp != "" {
 		budget := 200
 		if v := env("LOG_MAX_MB", ""); v != "" {
@@ -1308,6 +1308,22 @@ func main() {
 			log.Printf("file logging on: %s budget=%dMB", lp, budget)
 		}
 	}
+	// A 方案：内嵌 Bun sidecar。上游按客户端指纹发额度，Go 直连必 429，
+	// 所以默认把 upstream 换成 127.0.0.1:<端口> 的 bun 转发进程。
+	baseRaw := sidecarUpstream(env("OPENCODE_ZEN_BASE", "https://opencode.ai/inference/v1"))
+	upstream, err = url.Parse(baseRaw)
+	if err != nil {
+		log.Fatalf("OPENCODE_ZEN_BASE 非法: %v", err)
+	}
+	// 退出时收掉 bun；被强杀的情况由 sidecar 的 120s 心跳超时兜底。
+	defer sidecar.stop()
+	go func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+		<-ch
+		sidecar.stop()
+		os.Exit(0)
+	}()
 	apiKey = env("OPENCODE_ZEN_API_KEY", "public")
 	project = env("OPENCODE_ZEN_PROJECT", "global")
 	seedBuiltinTable()
@@ -1323,8 +1339,8 @@ func main() {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		s := statsSnapshot()
-		fmt.Fprintf(w, `{"status":"ok","mode":"direct","version":%q,"table_models":%d,"stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d}}`,
-			appVersion, tableModelCount(), s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
+		fmt.Fprintf(w, `{"status":"ok","mode":"direct","version":%q,"table_models":%d,"sidecar":%s,"stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d}}`,
+			appVersion, tableModelCount(), sidecar.statusJSON(), s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != "GET" {

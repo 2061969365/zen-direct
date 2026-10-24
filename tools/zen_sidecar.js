@@ -16,6 +16,9 @@
 //   ZEN_OFFICIAL_PROMPT_FILE  官方提示词文件，默认脚本同目录 official_system_prompt.txt
 //   ZEN_SIDECAR_STRIP_PROMPT  1 = 不注入官方提示词（仅用于 A/B 复现问题）
 //   ZEN_SIDECAR_VERBOSE       1 = 每个请求打一行日志（默认 1）
+//   ZEN_SIDECAR_PREFIX        允许转发的路径前缀，逗号分隔，默认 "/inference/,/zen/"
+//   ZEN_IDLE_EXIT_MS          >0 时，这么久没有任何请求或 /health 心跳就自杀
+//                             （网关内嵌启动时会设成 120000，防强杀留孤儿）
 
 const fs = require("fs");
 const path = require("path");
@@ -24,6 +27,10 @@ const PORT = Number(process.env.ZEN_SIDECAR_PORT || 19200);
 const UPSTREAM = (process.env.ZEN_UPSTREAM || "https://opencode.ai").replace(/\/+$/, "");
 const VERBOSE = process.env.ZEN_SIDECAR_VERBOSE !== "0";
 const STRIP = process.env.ZEN_SIDECAR_STRIP_PROMPT === "1";
+const IDLE_EXIT_MS = Number(process.env.ZEN_IDLE_EXIT_MS || 0);
+const PREFIXES = (process.env.ZEN_SIDECAR_PREFIX || "/inference/,/zen/")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+let lastSeen = Date.now();
 
 const promptFile = process.env.ZEN_OFFICIAL_PROMPT_FILE ||
   path.join(import.meta.dir, "official_system_prompt.txt");
@@ -75,11 +82,12 @@ Bun.serve({
   hostname: "127.0.0.1",
   idleTimeout: 180,
   async fetch(req) {
+    lastSeen = Date.now();
     const url = new URL(req.url);
     if (url.pathname === "/health") {
       return Response.json({ status: "ok", upstream: UPSTREAM, prompt: OFFICIAL.length, strip: STRIP });
     }
-    if (!url.pathname.startsWith("/inference/") && !url.pathname.startsWith("/zen/")) {
+    if (!PREFIXES.some((p) => url.pathname.startsWith(p))) {
       return new Response("not found", { status: 404 });
     }
 
@@ -125,3 +133,16 @@ Bun.serve({
 
 console.log(`[sidecar] listening on http://127.0.0.1:${PORT} -> ${UPSTREAM}`);
 console.log(`[sidecar] official prompt: ${OFFICIAL.length} chars${STRIP ? " (STRIPPED)" : ""}`);
+
+// 内嵌模式（网关启动时注入）：网关每 15s 打一次 /health。心跳断了说明网关
+// 已经被强杀（Stop-Process -Force 不会跑 defer），自己走人，别留孤儿占端口。
+if (IDLE_EXIT_MS > 0) {
+  const tick = Math.max(1000, Math.min(15000, Math.floor(IDLE_EXIT_MS / 3)));
+  setInterval(() => {
+    const idle = Date.now() - lastSeen;
+    if (idle > IDLE_EXIT_MS) {
+      console.log(`[sidecar] no gateway contact for ${idle}ms; exiting`);
+      process.exit(0);
+    }
+  }, tick).unref?.();
+}
