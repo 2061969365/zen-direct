@@ -1,0 +1,118 @@
+name: body-bisect
+
+# 同一台 runner、同一 IP，CLI 控制组之后，用 Python 重放 CLI 抓到的真实 body：
+#   P1 完整 CLI body（官方 system 提示词 + 12 工具 + max_completion_tokens）
+#   P2 同 body，只把 system/user 换成 DSH 的短提示词
+#   P3 同 body，只把 tools 清空
+#   P4 同 body，只把 max_completion_tokens 去掉
+# 每个都用现签 session + project=global，头完全一样。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bisect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: install opencode CLI
+        run: |
+          npm install -g @opencode/cli@latest 2>&1 | tail -1
+          opencode --version
+      - name: shard ${{ matrix.shard }}
+        run: |
+          set -u
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export OPENCODE_DISABLE_AUTOUPDATE=1
+          W="$PWD/_bb"; mkdir -p "$W"
+          IP=$(curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["query"])')
+          echo "shard=${{ matrix.shard }} ip=$IP"
+
+          set +e
+          timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free \
+            "Reply with the single word: ok" >"$W/c0.out" 2>"$W/c0.err"
+          C0=$?
+          set -e
+          echo "C0 exit=$C0 out=$(tail -1 "$W/c0.out")"
+          if [ "$C0" != "0" ]; then
+            echo "SHARD ${{ matrix.shard }} IP=$IP DIRTY"
+            exit 0
+          fi
+          echo "SHARD ${{ matrix.shard }} IP=$IP CLEAN"
+
+          cat > "$W/b.py" <<'PY'
+          import copy, json, random, time
+          from http.client import HTTPSConnection
+
+          base = json.load(open("tools/cli_capture_body.json", encoding="utf-8"))
+          print("fixture: tools=%d msgs=%d syslen=%d max_tokens=%s" % (
+              len(base.get("tools") or []), len(base.get("messages") or []),
+              len(base["messages"][0]["content"]), base.get("max_completion_tokens")))
+
+          def mint():
+              ts = int(time.time() * 1000)
+              n = (~(ts * 0x1000)) & ((1 << 64) - 1)
+              hx = "0123456789abcdef"
+              al = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+              s = "ses_" + "".join(
+                  hx[((n >> (40 - 8 * i)) & 0xff) >> 4] + hx[((n >> (40 - 8 * i)) & 0xff) & 0xf]
+                  for i in range(6))
+              return s + "".join(random.choice(al) for _ in range(14))
+
+          def send(tag, body):
+              ses = mint()
+              raw = json.dumps(body).encode()
+              conn = HTTPSConnection("opencode.ai", timeout=120)
+              conn.putrequest("POST", "/inference/v1/chat/completions",
+                              skip_host=True, skip_accept_encoding=True)
+              for k, v in {
+                  "Authorization": "Bearer public",
+                  "Content-Type": "application/json",
+                  "User-Agent": "opencode/latest/2.0.29/cli",
+                  "X-Opencode-Client": "cli",
+                  "X-Opencode-Project": "global",
+                  "X-Opencode-Session": ses,
+                  "X-Opencode-Session-Id": ses,
+                  "X-Session-Affinity": ses,
+                  "X-Session-Id": ses,
+              }.items():
+                  conn.putheader(k, v)
+              conn.putheader("Host", "opencode.ai")
+              conn.putheader("Content-Length", str(len(raw)))
+              conn.endheaders()
+              conn.send(raw)
+              r = conn.getresponse()
+              head = r.read(160).decode("utf-8", "replace")
+              print("%s -> %s %r retry-after=%s" % (tag, r.status, head[:130], r.getheader("Retry-After")))
+              conn.close()
+
+          send("P1 full-cli-body", copy.deepcopy(base))
+
+          p2 = copy.deepcopy(base)
+          p2["messages"] = [
+              {"role": "system", "content": "You are an AI agent powered by DeepSeek Harness."},
+              {"role": "user", "content": "body bisect check 202"}]
+          send("P2 dsh-prompt", p2)
+
+          p3 = copy.deepcopy(base)
+          p3.pop("tools", None)
+          send("P3 no-tools", p3)
+
+          p4 = copy.deepcopy(base)
+          p4.pop("max_completion_tokens", None)
+          send("P4 no-max-tokens", p4)
+          PY
+          python3 "$W/b.py"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: body-bisect-${{ matrix.shard }}
+          path: _bb
