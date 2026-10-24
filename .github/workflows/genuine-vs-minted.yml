@@ -1,0 +1,115 @@
+name: genuine-vs-minted
+
+# 同一台 runner、同一个 IP：
+#   1) CLI 控制组 —— 判断 IP 是否干净
+#   2) 网关 + opencode serve 现铸真会话（OPENCODE_SERVICE_URL）
+#   3) 网关 + 本地 mint（SVC_OFF=1，空 genuine 名单）
+# 判定：2=200 且 3=429 → 根因是会话来源（真会话 vs 自签），修复方向是常驻 service。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: install opencode CLI
+        run: |
+          npm install -g @opencode/cli@latest 2>&1 | tail -1
+          opencode --version
+      - name: egress IP
+        run: curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; j=json.load(sys.stdin); print(j["query"], j["city"])'
+      - name: genuine vs minted on one IP
+        run: |
+          set -u
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export OPENCODE_DISABLE_AUTOUPDATE=1
+          W="$PWD/_gm"; mkdir -p "$W"
+          go build -trimpath -o zen-direct .
+
+          echo "=== control: real CLI ==="
+          set +e
+          timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free \
+            "Reply with the single word: ok" >"$W/cli.out" 2>"$W/cli.err"
+          echo "cli_exit=$?"
+          set -e
+          tail -2 "$W/cli.out"; tail -3 "$W/cli.err"
+
+          echo "=== boot opencode serve ==="
+          nohup opencode serve --port 4096 >"$W/serve.log" 2>&1 &
+          for i in $(seq 1 40); do
+            grep -q 'server listening' "$W/serve.log" 2>/dev/null && break
+            sleep 1
+          done
+          grep -E 'server (listening|password)' "$W/serve.log" | sed 's/password .*/password ***/'
+          SVC_PW=$(grep -oP 'server password \K\S+' "$W/serve.log" | head -1)
+          echo "svc password parsed: $([ -n "${SVC_PW:-}" ] && echo yes || echo NO)"
+
+          mkdir -p "$W/svc" "$W/mint"; : > "$W/svc/genuine.txt"; : > "$W/mint/genuine.txt"
+
+          echo "=== gateway A: service-minted genuine sessions ==="
+          nohup env PORT=18081 OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1 \
+            DIRECT_FRESH_PER_TURN=0 DIRECT_DEBUG=1 DIRECT_DIAG=1 \
+            OPENCODE_SERVICE_URL=http://127.0.0.1:4096 \
+            OPENCODE_SERVER_PASSWORD="${SVC_PW:-}" \
+            LOG_FILE="$W/svc/gw.log" SHIM_SESSION_FILE="$W/svc/shim.json" \
+            DIRECT_POISON_FILE="$W/svc/poison.txt" GENUINE_SESSION_FILE="$W/svc/genuine.txt" \
+            ./zen-direct >"$W/svc/gw.err" 2>&1 &
+
+          echo "=== gateway B: local mint (no service) ==="
+          nohup env PORT=18082 OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1 \
+            DIRECT_FRESH_PER_TURN=0 DIRECT_DEBUG=1 DIRECT_DIAG=1 SVC_OFF=1 \
+            LOG_FILE="$W/mint/gw.log" SHIM_SESSION_FILE="$W/mint/shim.json" \
+            DIRECT_POISON_FILE="$W/mint/poison.txt" GENUINE_SESSION_FILE="$W/mint/genuine.txt" \
+            ./zen-direct >"$W/mint/gw.err" 2>&1 &
+
+          for p in 18081 18082; do
+            for i in $(seq 1 60); do
+              curl -sf -m 2 http://127.0.0.1:$p/health >/dev/null 2>&1 && break
+              sleep 0.3
+            done
+          done
+
+          cat > "$W/post.py" <<'PY'
+          import json, sys, urllib.request, urllib.error
+          port, tag, text = sys.argv[1], sys.argv[2], sys.argv[3]
+          body = json.dumps({"model": "deepseek-v4.1-flash-free", "stream": False,
+                             "messages": [{"role": "system", "content": "You are an AI agent powered by DeepSeek Harness."},
+                                          {"role": "user", "content": text}]}).encode()
+          req = urllib.request.Request("http://127.0.0.1:%s/v1/chat/completions" % port,
+                                       data=body, method="POST")
+          req.add_header("Content-Type", "application/json")
+          try:
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  print("%s -> %s %r" % (tag, r.status, r.read(100)[:100]))
+          except urllib.error.HTTPError as e:
+              print("%s -> %s %r retry-after=%s" % (tag, e.code, e.read(160)[:160],
+                                                    e.headers.get("Retry-After")))
+          except Exception as e:
+              print("%s -> ERR %s" % (tag, e))
+          PY
+
+          echo "=== requests ==="
+          python3 "$W/post.py" 18081 "GW-svc-minted" "genuine session check 1"
+          sleep 2
+          python3 "$W/post.py" 18082 "GW-local-mint" "genuine session check 2"
+          sleep 2
+          python3 "$W/post.py" 18081 "GW-svc-minted-2" "genuine session check 3"
+
+          echo "=== logs ==="
+          echo "--- svc ---"
+          grep -E '\[svc|\[REQ|free-usage' "$W/svc/gw.log" | sed -E 's/ debug upBody.*//' | tail -12
+          echo "--- mint ---"
+          grep -E '\[svc|\[REQ|free-usage' "$W/mint/gw.log" | sed -E 's/ debug upBody.*//' | tail -8
+          pkill -f 'zen-direct' || true
+          pkill -f 'opencode serve' || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: genuine-vs-minted
+          path: _gm
