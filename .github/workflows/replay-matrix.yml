@@ -1,0 +1,143 @@
+name: replay-matrix
+
+# 同一台 runner、同一个 IP，逐项二分：
+#   P0  CLI 经抓包代理（Python TLS + CLI 头/体）→ 200 则 TLS 指纹无关
+#   P1  原样重放 CLI 的请求（同 session、同头、同体）
+#   P2  只把 session 换成现签 id，其余不动
+#   P3  只把 x-opencode-project 换成 global，其余不动
+#   P4  网关默认（global + 2 桩工具 + UA 2.0.29）
+# 判定：P1 200 + P4 429 时，看 P2/P3 谁掉，就是谁的问题。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: install opencode CLI
+        run: |
+          npm install -g @opencode/cli@latest 2>&1 | tail -1
+          opencode --version
+      - name: egress IP
+        run: curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; j=json.load(sys.stdin); print(j["query"], j["city"])'
+      - name: replay matrix on one IP
+        run: |
+          set -u
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export OPENCODE_DISABLE_AUTOUPDATE=1
+          W="$PWD/_rm"; mkdir -p "$W"
+          go build -trimpath -o zen-direct .
+
+          python3 tools/capture_proxy.py --port 19100 --out "$W/cap" >"$W/proxy.log" 2>&1 &
+          sleep 2
+
+          echo "=== P0: CLI through capture proxy (Python TLS) ==="
+          set +e
+          OPENCODE_CONFIG_CONTENT='{"provider":{"opencode":{"options":{"baseURL":"http://127.0.0.1:19100/inference/v1"}}}}' \
+            timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free \
+            "Reply with the single word: ok" >"$W/cli.out" 2>"$W/cli.err"
+          echo "cli_exit=$?"
+          set -e
+          tail -2 "$W/cli.out"; tail -4 "$W/cli.err"
+
+          echo "=== P1-P3: replay the captured request ==="
+          cat > "$W/replay.py" <<'PY'
+          import glob, json, random, string, sys
+          from http.client import HTTPSConnection
+
+          caps = []
+          for p in sorted(glob.glob("_rm/cap/*.json")):
+              j = json.load(open(p, encoding="utf-8"))
+              if j.get("method") == "POST" and j.get("upstream_status") in (200, 429, 403):
+                  caps.append(j)
+          ok = [c for c in caps if c.get("upstream_status") == 200]
+          pick = ok[-1] if ok else caps[-1]
+          print("replaying capture: %s (upstream was %s)" % (pick["path"], pick.get("upstream_status")))
+          body = pick["body"]
+          base_headers = {k: v for k, v in pick["headers"].items()
+                          if k.lower() not in ("host", "content-length", "accept-encoding", "connection")}
+
+          def send(tag, headers, body):
+              conn = HTTPSConnection("opencode.ai", timeout=180)
+              conn.putrequest("POST", pick["path"], skip_host=True, skip_accept_encoding=True)
+              for k, v in headers.items():
+                  conn.putheader(k, v)
+              conn.putheader("Host", "opencode.ai")
+              conn.putheader("Content-Length", str(len(body.encode())))
+              conn.endheaders()
+              conn.send(body.encode())
+              r = conn.getresponse()
+              head = r.read(200).decode("utf-8", "replace")
+              print("%s -> %s %r retry-after=%s" % (tag, r.status, head[:150], r.getheader("Retry-After")))
+              conn.close()
+
+          send("P1 replay-exact", base_headers, body)
+
+          b = json.loads(body)
+          ses = (base_headers.get("x-opencode-session") or base_headers.get("X-Opencode-Session") or "")
+          print("captured session:", ses, "project:",
+                base_headers.get("x-opencode-project") or base_headers.get("X-Opencode-Project"))
+          print("captured UA:", base_headers.get("user-agent") or base_headers.get("User-Agent"))
+
+          def mint():
+              import time
+              ts = int(time.time() * 1000)
+              n = (~(ts * 0x1000)) & ((1 << 64) - 1)
+              hx = "0123456789abcdef"
+              al = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+              s = "ses_" + "".join(
+                  hx[((n >> (40 - 8 * i)) & 0xff) >> 4] + hx[((n >> (40 - 8 * i)) & 0xff) & 0xf]
+                  for i in range(6))
+              return s + "".join(random.choice(al) for _ in range(14))
+
+          new = mint()
+          h2 = dict(base_headers)
+          for k in list(h2):
+              if k.lower() in ("x-opencode-session", "x-opencode-session-id", "x-session-affinity", "x-session-id"):
+                  h2[k] = new
+          send("P2 replay-minted-session (%s)" % new[:14], h2, body)
+
+          h3 = dict(base_headers)
+          for k in list(h3):
+              if k.lower() == "x-opencode-project":
+                  h3[k] = "global"
+          send("P3 replay-project-global", h3, body)
+          PY
+          python3 "$W/replay.py"
+
+          echo "=== P4: gateway default ==="
+          mkdir -p "$W/gw"; : > "$W/gw/genuine.txt"
+          nohup env PORT=18081 OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1 \
+            DIRECT_FRESH_PER_TURN=0 DIRECT_DEBUG=1 DIRECT_DIAG=1 SVC_OFF=1 \
+            LOG_FILE="$W/gw/gw.log" SHIM_SESSION_FILE="$W/gw/shim.json" \
+            DIRECT_POISON_FILE="$W/gw/poison.txt" GENUINE_SESSION_FILE="$W/gw/genuine.txt" \
+            ./zen-direct >"$W/gw/gw.err" 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf -m 2 http://127.0.0.1:18081/health >/dev/null 2>&1 && break
+            sleep 0.3
+          done
+          python3 - <<'PY'
+          import json, urllib.request, urllib.error
+          body = json.dumps({"model": "deepseek-v4.1-flash-free", "stream": False,
+                             "messages": [{"role": "system", "content": "You are an AI agent powered by DeepSeek Harness."},
+                                          {"role": "user", "content": "replay matrix 42"}]}).encode()
+          req = urllib.request.Request("http://127.0.0.1:18081/v1/chat/completions", data=body, method="POST")
+          req.add_header("Content-Type", "application/json")
+          try:
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  print("P4 GW-default ->", r.status, r.read(100)[:100])
+          except urllib.error.HTTPError as e:
+              print("P4 GW-default ->", e.code, e.read(160)[:160], "retry-after=", e.headers.get("Retry-After"))
+          PY
+          pkill -f 'zen-direct' || true; pkill -f capture_proxy || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: replay-matrix
+          path: _rm
