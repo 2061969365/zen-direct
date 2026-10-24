@@ -132,21 +132,44 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// sidecarDir 释放目录。放在 LOCALAPPDATA 而不是 exe 同目录：
-// 程序可能装在 Program Files（只读），而且升级时换 exe 不换脚本。
-func sidecarDir() string {
+// sidecarDirs 释放目录候选，按顺序取第一个可写的：
+//  1. ZEN_SIDECAR_DIR（显式指定，不猜）
+//  2. %LOCALAPPDATA%\zen-direct\sidecar（常规；Program Files 只读时也能用）
+//  3. exe 同目录\sidecar（绿色/便携部署）
+//  4. %TEMP%\zen-direct-sidecar（兜底；受限环境里 LOCALAPPDATA 可能写不进去）
+func sidecarDirs() []string {
 	if v := strings.TrimSpace(os.Getenv("ZEN_SIDECAR_DIR")); v != "" {
-		return v
+		return []string{v}
 	}
+	var out []string
 	if runtime.GOOS == "windows" {
 		if la := strings.TrimSpace(os.Getenv("LOCALAPPDATA")); la != "" {
-			return filepath.Join(la, "zen-direct", "sidecar")
+			out = append(out, filepath.Join(la, "zen-direct", "sidecar"))
 		}
 	}
 	if d, err := os.UserCacheDir(); err == nil && d != "" {
-		return filepath.Join(d, "zen-direct", "sidecar")
+		out = append(out, filepath.Join(d, "zen-direct", "sidecar"))
 	}
-	return filepath.Join(os.TempDir(), "zen-direct-sidecar")
+	if exe, err := os.Executable(); err == nil && exe != "" {
+		out = append(out, filepath.Join(filepath.Dir(exe), "sidecar"))
+	}
+	out = append(out, filepath.Join(os.TempDir(), "zen-direct-sidecar"))
+	return out
+}
+
+// writableDir 真写一个探针文件再删：MkdirAll 成功不代表能落盘（ACL/只读卷）。
+func writableDir(dir string) bool {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return false
+	}
+	f, err := os.CreateTemp(dir, ".probe-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	f.Close()
+	os.Remove(name)
+	return true
 }
 
 // writeIfChanged 只在内容不同时落盘（升级后第一次启动会重写，之后不动）。
@@ -241,9 +264,18 @@ func prepareSidecarFiles() (string, string, string, error) {
 	if len(embeddedSidecarJS) == 0 || len(embeddedSidecarPrompt) == 0 {
 		return "", "", "", errors.New("内嵌 sidecar 资产为空（构建时缺 tools/）")
 	}
-	dir := sidecarDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", "", "", fmt.Errorf("建目录 %s 失败: %w", dir, err)
+	var dir string
+	var tried []string
+	for _, cand := range sidecarDirs() {
+		if !writableDir(cand) {
+			tried = append(tried, cand)
+			continue
+		}
+		dir = cand
+		break
+	}
+	if dir == "" {
+		return "", "", "", fmt.Errorf("没有可写目录（试过: %s）", strings.Join(tried, "; "))
 	}
 	jsPath := filepath.Join(dir, "zen_sidecar.js")
 	if _, err := writeIfChanged(jsPath, embeddedSidecarJS); err != nil {

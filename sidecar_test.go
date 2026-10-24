@@ -94,6 +94,35 @@ func TestWriteIfChangedSkipsIdentical(t *testing.T) {
 	}
 }
 
+func TestSidecarDirsFallback(t *testing.T) {
+	t.Setenv("ZEN_SIDECAR_DIR", `C:\explicit\dir`)
+	if got := sidecarDirs(); len(got) != 1 || got[0] != `C:\explicit\dir` {
+		t.Errorf("显式目录应独占候选: %v", got)
+	}
+	t.Setenv("ZEN_SIDECAR_DIR", "")
+	dirs := sidecarDirs()
+	if len(dirs) < 2 {
+		t.Fatalf("候选太少: %v", dirs)
+	}
+	if !strings.HasSuffix(dirs[len(dirs)-1], "zen-direct-sidecar") {
+		t.Errorf("最后一个候选应是 TEMP 兜底: %v", dirs)
+	}
+}
+
+// 路径被普通文件占住时必须判为不可写（MkdirAll 会报错）。
+func TestWritableDirRejectsFile(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "occupied")
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if writableDir(p) {
+		t.Error("文件路径被判成可写目录")
+	}
+	if !writableDir(filepath.Join(t.TempDir(), "ok")) {
+		t.Error("临时目录应可写")
+	}
+}
+
 func TestPrepareSidecarFiles(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("ZEN_SIDECAR_DIR", dir)
