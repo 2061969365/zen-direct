@@ -197,10 +197,11 @@ func dialWith(ctx context.Context, network, addr string, id utls.ClientHelloID, 
 }
 
 type variant struct {
-	name   string
-	id     utls.ClientHelloID
-	specFn func() *utls.ClientHelloSpec
-	h2     bool
+	name        string
+	id          utls.ClientHelloID
+	specFn      func() *utls.ClientHelloSpec
+	h2          bool
+	fullHeaders bool
 }
 
 func send(raw []byte, v variant) (int, string) {
@@ -215,6 +216,14 @@ func send(raw []byte, v variant) (int, string) {
 	req.Header.Set("X-Opencode-Session-Id", ses)
 	req.Header.Set("X-Session-Affinity", ses)
 	req.Header.Set("X-Session-Id", ses)
+	if v.fullHeaders {
+		// Bun fetch 自动加的三个头；门禁可能做头一致性检查。
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+		if !v.h2 {
+			req.Header.Set("Connection", "keep-alive")
+		}
+	}
 
 	var rt http.RoundTripper
 	if v.h2 {
@@ -256,12 +265,14 @@ func main() {
 	fmt.Printf("body bytes=%d prompt=%d\n", len(raw), len(official))
 
 	variants := []variant{
-		{"bun-h2", utls.HelloCustom, func() *utls.ClientHelloSpec { return bunSpec([]string{"h2", "http/1.1"}) }, true},
-		{"bun-h1", utls.HelloCustom, func() *utls.ClientHelloSpec { return bunSpec([]string{"http/1.1"}) }, false},
-		{"chrome-h1", utls.HelloChrome_Auto, presetH1(utls.HelloChrome_Auto), false},
-		{"chrome-h2", utls.HelloChrome_Auto, nil, true},
-		{"firefox-h1", utls.HelloFirefox_Auto, presetH1(utls.HelloFirefox_Auto), false},
-		{"safari-h1", utls.HelloSafari_Auto, presetH1(utls.HelloSafari_Auto), false},
+		{"bun-h2", utls.HelloCustom, func() *utls.ClientHelloSpec { return bunSpec([]string{"h2", "http/1.1"}) }, true, false},
+		{"bun-h1", utls.HelloCustom, func() *utls.ClientHelloSpec { return bunSpec([]string{"http/1.1"}) }, false, false},
+		{"bun-h1-full", utls.HelloCustom, func() *utls.ClientHelloSpec { return bunSpec([]string{"http/1.1"}) }, false, true},
+		{"bun-h2-full", utls.HelloCustom, func() *utls.ClientHelloSpec { return bunSpec([]string{"h2", "http/1.1"}) }, true, true},
+		{"chrome-h1", utls.HelloChrome_Auto, presetH1(utls.HelloChrome_Auto), false, false},
+		{"chrome-h2", utls.HelloChrome_Auto, nil, true, false},
+		{"firefox-h1", utls.HelloFirefox_Auto, presetH1(utls.HelloFirefox_Auto), false, false},
+		{"safari-h1", utls.HelloSafari_Auto, presetH1(utls.HelloSafari_Auto), false, false},
 	}
 	only := ""
 	if len(os.Args) > 2 {

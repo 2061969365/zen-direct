@@ -59,7 +59,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [bun-h2, bun-h1, chrome-h2, chrome-h1]
+        variant: [bun-h2-full, bun-h1-full]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
