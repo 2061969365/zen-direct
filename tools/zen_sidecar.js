@@ -17,6 +17,9 @@
 //   ZEN_SIDECAR_STRIP_PROMPT  1 = 不注入官方提示词（仅用于 A/B 复现问题）
 //   ZEN_SIDECAR_VERBOSE       1 = 每个请求打一行日志（默认 1）
 //   ZEN_SIDECAR_PREFIX        允许转发的路径前缀，逗号分隔，默认 "/inference/,/zen/"
+//   ZEN_SIDECAR_KEEPALIVE     1 = 复用连接（默认 0：每个请求新建连接）
+//                             默认关是有意的：出口是轮换代理时，只有新连接才会
+//                             换出口 IP；Bun 默认把连接池住 300s，切了节点也不换。
 //   ZEN_IDLE_EXIT_MS          >0 时，这么久没有任何请求或 /health 心跳就自杀
 //                             （网关内嵌启动时会设成 120000，防强杀留孤儿）
 
@@ -27,6 +30,7 @@ const PORT = Number(process.env.ZEN_SIDECAR_PORT || 19200);
 const UPSTREAM = (process.env.ZEN_UPSTREAM || "https://opencode.ai").replace(/\/+$/, "");
 const VERBOSE = process.env.ZEN_SIDECAR_VERBOSE !== "0";
 const STRIP = process.env.ZEN_SIDECAR_STRIP_PROMPT === "1";
+const KEEPALIVE = process.env.ZEN_SIDECAR_KEEPALIVE === "1";
 const IDLE_EXIT_MS = Number(process.env.ZEN_IDLE_EXIT_MS || 0);
 const PREFIXES = (process.env.ZEN_SIDECAR_PREFIX || "/inference/,/zen/")
   .split(",").map((s) => s.trim()).filter(Boolean);
@@ -85,7 +89,7 @@ Bun.serve({
     lastSeen = Date.now();
     const url = new URL(req.url);
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", upstream: UPSTREAM, prompt: OFFICIAL.length, strip: STRIP });
+      return Response.json({ status: "ok", upstream: UPSTREAM, prompt: OFFICIAL.length, strip: STRIP, keepalive: KEEPALIVE });
     }
     if (!PREFIXES.some((p) => url.pathname.startsWith(p))) {
       return new Response("not found", { status: 404 });
@@ -116,6 +120,9 @@ Bun.serve({
         headers,
         body,
         redirect: "manual",
+        // 默认每请求新建连接：出口是轮换代理时，连接池会把出口 IP 钉死 300s，
+        // 429 之后想换 IP 换不掉。ZEN_SIDECAR_KEEPALIVE=1 可恢复复用。
+        keepalive: KEEPALIVE,
       });
       const out = new Headers(r.headers);
       for (const h of ["content-encoding", "content-length", "transfer-encoding", "connection"]) {
@@ -133,6 +140,7 @@ Bun.serve({
 
 console.log(`[sidecar] listening on http://127.0.0.1:${PORT} -> ${UPSTREAM}`);
 console.log(`[sidecar] official prompt: ${OFFICIAL.length} chars${STRIP ? " (STRIPPED)" : ""}`);
+console.log(`[sidecar] connection: ${KEEPALIVE ? "keep-alive pool" : "per-request (no reuse) -> new egress ip"}`);
 
 // 内嵌模式（网关启动时注入）：网关每 15s 打一次 /health。心跳断了说明网关
 // 已经被强杀（Stop-Process -Force 不会跑 defer），自己走人，别留孤儿占端口。

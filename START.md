@@ -186,6 +186,10 @@ harness 见 failed 帧可安全重试（本轮内容由重试无损拿回）。
     客户端 :8081 -> zen-direct.exe -> 127.0.0.1:<随机端口> (bun zen_sidecar.js) -> opencode.ai
 
 - 端口：默认每次启动挑空闲端口；`ZEN_SIDECAR_PORT` 可固定。
+- 连接：**默认每请求新建连接**（`keepalive: false`）。因为出口走轮换代理时，只有新连接
+  才会换出口 IP；Bun 默认把连接池住 300s，切了节点也不换 —— 429 之后最需要换 IP 的那几十秒
+  恰恰换不掉。代价是每请求多一次 TLS/CONNECT 握手（走代理约 +50~150ms）。
+  `ZEN_SIDECAR_KEEPALIVE=1` 可恢复连接复用。
 - 托管：bun 退出后指数退避重启（1s→30s 封顶），网关退出时收掉；网关被强杀时
   bun 靠 120s 无心跳自杀，不留孤儿。
 - 观测：`GET /health` 里的 `sidecar` 字段（state/pid/port/restarts/last_error）；
@@ -196,7 +200,8 @@ harness 见 failed 帧可安全重试（本轮内容由重试无损拿回）。
 | `DIRECT_SIDECAR` | `auto` | `off` = 直连（仅排障，会 429） |
 | `ZEN_BUN` | 空 | 空=自动找 PATH / `%USERPROFILE%\.bun` / npm 的 `bun.exe` |
 | `ZEN_SIDECAR_PORT` | 空 | 空=自动挑空闲端口 |
-| `ZEN_SIDECAR_DIR` | `%LOCALAPPDATA%\zen-direct\sidecar` | 释放目录 |
+| `ZEN_SIDECAR_DIR` | `%LOCALAPPDATA%\zen-direct\sidecar` | 释放目录（不可写时回退 exe 同目录 → TEMP） |
+| `ZEN_SIDECAR_KEEPALIVE` | 空 | `1` = 复用连接；默认每请求新建（换代理节点立即生效） |
 | `OPENCODE_ZEN_BASE` | `https://opencode.ai/inference/v1` | 远端上游；指向 loopback 时视为外部 sidecar，不再内嵌 |
 | `DIRECT_SIDECAR_STRIP_PROMPT` | 空 | `1` = 不注入官方提示词（A/B 复现） |
 

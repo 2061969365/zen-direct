@@ -6,12 +6,14 @@ package main
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -181,6 +183,65 @@ func TestSidecarUpstreamDecisions(t *testing.T) {
 	}
 }
 
+// 默认每请求新建连接：连续两发在（假）上游看来必须是两个不同的客户端端口。
+// 这是"429 后换代理节点能立刻换出口 IP"的前提。
+func TestSidecarNewConnPerRequest(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode")
+	}
+	if bunBinary() == "" {
+		t.Skip("no bun on this machine")
+	}
+
+	var mu sync.Mutex
+	var ports []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, port, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			mu.Lock()
+			ports = append(ports, port)
+			mu.Unlock()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer up.Close()
+
+	// 先建临时目录再注册停止：t.Cleanup 是 LIFO，目录清理必须先于 stop 注册，
+	// 否则会在 bun 还活着的时候删目录（Windows 上文件被占用直接失败）。
+	dir := t.TempDir()
+	old := sidecar
+	sidecar = newSidecarProc()
+	t.Cleanup(func() {
+		sidecar.stop()
+		sidecar = old
+	})
+	t.Setenv("ZEN_SIDECAR_DIR", dir)
+	t.Setenv("ZEN_SIDECAR_PORT", "")
+	t.Setenv("ZEN_SIDECAR_KEEPALIVE", "") // 默认：不复用
+
+	base, err := startSidecar(up.URL, "/inference/v1")
+	if err != nil {
+		t.Fatalf("startSidecar: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		resp, err := sidecar.client.Post(base+"/chat/completions", "application/json",
+			strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatalf("post %d: %v", i, err)
+		}
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ports) != 2 {
+		t.Fatalf("上游收到 %d 个请求，期望 2", len(ports))
+	}
+	if ports[0] == ports[1] {
+		t.Fatalf("连接被复用（两次都是端口 %s），keepalive:false 没生效", ports[0])
+	}
+}
+
 // 真 spawn：bun 起在随机端口 -> /health -> 注入官方提示词 -> 转发到假上游。
 // 全程不出本机，不碰 opencode.ai。
 func TestSidecarSpawnInjectsPrompt(t *testing.T) {
@@ -203,11 +264,12 @@ func TestSidecarSpawnInjectsPrompt(t *testing.T) {
 
 	old := sidecar
 	sidecar = newSidecarProc()
+	dir := t.TempDir() // 先建目录（LIFO 清理顺序，见上）
 	t.Cleanup(func() {
 		sidecar.stop()
 		sidecar = old
 	})
-	t.Setenv("ZEN_SIDECAR_DIR", t.TempDir())
+	t.Setenv("ZEN_SIDECAR_DIR", dir)
 	t.Setenv("ZEN_SIDECAR_PORT", "")
 
 	base, err := startSidecar(up.URL, "/inference/v1")

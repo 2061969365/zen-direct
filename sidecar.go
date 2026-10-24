@@ -85,6 +85,7 @@ type sidecarProc struct {
 	restarts int
 	lastErr  string
 	cmd      *exec.Cmd
+	exitCh   chan struct{} // 当前子进程退出信号（supervise 关闭）
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	client   *http.Client
@@ -323,7 +324,7 @@ func startSidecar(origin, basePath string) (string, error) {
 		return "", err
 	}
 	if err := sidecar.waitHealthy(sidecarStartWait); err != nil {
-		sidecar.killCurrent()
+		sidecar.reapAndClose()
 		sidecar.setErr(err)
 		return "", fmt.Errorf("sidecar /health 未就绪: %w", err)
 	}
@@ -389,6 +390,7 @@ func (s *sidecarProc) launch(jsPath, promptPath string) error {
 	}
 	s.mu.Lock()
 	s.cmd = cmd
+	s.exitCh = make(chan struct{})
 	s.pid = cmd.Process.Pid
 	s.mu.Unlock()
 	go s.pipeLogs(stdout)
@@ -421,6 +423,7 @@ func (s *sidecarProc) supervise(jsPath, promptPath string) {
 		var werr error
 		if cmd != nil {
 			werr = cmd.Wait() // 每个进程只 Wait 一次
+			s.closeExit()
 		}
 		select {
 		case <-s.stopCh:
@@ -534,15 +537,36 @@ func (s *sidecarProc) ping() error {
 }
 
 // stop 关掉子进程并终结 supervise 循环（可重复调用）。
+// 杀掉之后等它真的退出：Windows 上进程没退干净会锁着释放目录里的 .js，
+// 升级/测试里紧接着删目录会失败。
 func (s *sidecarProc) stop() {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 		log.Printf("sidecar stopped")
 	})
+	s.mu.Lock()
+	ch := s.exitCh
+	s.mu.Unlock()
 	s.killCurrent()
+	if ch != nil {
+		select {
+		case <-ch:
+		case <-time.After(3 * time.Second):
+		}
+	}
 	s.mu.Lock()
 	s.state = sidecarStopped
 	s.pid = 0
+	s.mu.Unlock()
+}
+
+// closeExit 关闭当前子进程的退出信号（只关一次）。
+func (s *sidecarProc) closeExit() {
+	s.mu.Lock()
+	if s.exitCh != nil {
+		close(s.exitCh)
+		s.exitCh = nil
+	}
 	s.mu.Unlock()
 }
 
@@ -552,6 +576,21 @@ func (s *sidecarProc) killCurrent() {
 	s.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
+	}
+}
+
+// reapAndClose 杀掉当前子进程并等它退出（supervise 尚未启动时就地收尸，
+// 否则没人 Wait，exitCh 永远不关，stop() 要白等 3s）。
+func (s *sidecarProc) reapAndClose() {
+	s.mu.Lock()
+	cmd := s.cmd
+	s.mu.Unlock()
+	s.killCurrent()
+	if cmd != nil {
+		go func() {
+			_ = cmd.Wait()
+			s.closeExit()
+		}()
 	}
 }
 
