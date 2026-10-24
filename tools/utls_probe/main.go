@@ -109,7 +109,7 @@ func buildBody(official string) []byte {
 //	padding 补齐到 512 字节
 func bunSpec(alpn []string) *utls.ClientHelloSpec {
 	curves := []utls.CurveID{
-		utls.X25519, utls.CurveP256, utls.X448, utls.CurveP521, utls.CurveP384,
+		utls.X25519, utls.CurveP256, utls.CurveID(0x001e), utls.CurveP521, utls.CurveP384,
 		utls.CurveID(0x0100), utls.CurveID(0x0101), utls.CurveID(0x0102),
 		utls.CurveID(0x0103), utls.CurveID(0x0104),
 	}
@@ -140,7 +140,7 @@ func bunSpec(alpn []string) *utls.ClientHelloSpec {
 			&utls.SupportedVersionsExtension{Versions: []uint16{0x0304, 0x0303}},
 			&utls.PSKKeyExchangeModesExtension{Modes: []uint8{1}},
 			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{{Group: utls.X25519}}},
-			&utls.PaddingExtension{PadTo: 512},
+			&utls.UtlsPaddingExtension{GetPaddingLen: utls.BoringPaddingStyle},
 		},
 	}
 }
