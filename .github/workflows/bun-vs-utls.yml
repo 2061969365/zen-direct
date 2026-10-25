@@ -11,6 +11,8 @@ name: bun-vs-utls
 #   A=429                     → 这个 IP 脏/配额空，本 shard 作废
 
 on:
+  push:
+    branches: [tls-ab]
   workflow_dispatch:
 
 jobs:
